@@ -16,6 +16,13 @@ data_dir  <- "X:/moore/SpectralBiodiversity/Data/NEON_Flux"
 out_csv   <- "X:/moore/SpectralBiodiversity/Data/NEON_Flux/annual_daytime_footprint_extent.csv"
 contour   <- 0.80
 
+# NEON force-publishes a monthly HDF5 file with valid structure/timestamps but
+# every footprint cell set to NaN when source data isn't received within 30 days
+# of the processing window. footRaster() reads these without error, so they must
+# be detected by content, not by read failure. A file is treated as a placeholder
+# if even its most-complete layer is below this fraction of non-NA cells.
+placeholder_frac_threshold <- 0.01
+
 towers_df <- read.csv("./Data/NEONsites.csv") %>%
   mutate(neon_site = str_extract(Site.Name, "(?<=\\()[A-Za-z0-9]{4}(?=\\)\\s*$)")) %>%
   filter(!is.na(neon_site))
@@ -47,6 +54,10 @@ process_site_year <- function(tower_id, neon_site, lat, lon, yr, data_files) {
   for (df in data_files) {
     st <- tryCatch({
       raw_st <- footRaster(filepath = df, progress = FALSE)
+      frac_valid <- max(terra::global(raw_st, fun = "notNA")$notNA) / terra::ncell(raw_st)
+      if (frac_valid < placeholder_frac_threshold) {
+        stop("placeholder file (footprint data is NaN-filled)")
+      }
       terra::wrap(raw_st)
     }, error = function(e) NULL)
     if (!is.null(st)) good_stacks[[length(good_stacks) + 1]] <- st
