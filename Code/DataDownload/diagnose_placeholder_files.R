@@ -20,7 +20,9 @@ year_filter <- if (length(args) >= 2) args[2] else NULL
 
 all_files <- list.files(site_dir, pattern = "\\.h5$", recursive = TRUE, full.names = TRUE)
 if (!is.null(year_filter)) {
-  all_files <- all_files[grepl(paste0("\\.", year_filter, "-\\d{2}\\."), basename(all_files))]
+  # files are published one per DAY ("...2025-01-01...."), so match with an
+  # optional day component rather than assuming "YYYY-MM." directly
+  all_files <- all_files[grepl(paste0("\\.", year_filter, "-\\d{2}(-\\d{2})?\\."), basename(all_files))]
 }
 all_files <- sort(all_files)
 

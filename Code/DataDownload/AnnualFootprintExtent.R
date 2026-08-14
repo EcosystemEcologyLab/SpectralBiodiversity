@@ -28,11 +28,19 @@ towers_df <- read.csv("./Data/NEONsites.csv") %>%
   filter(!is.na(neon_site))
 
 # ---- 2. Helpers (identical to process_footprints.R) ---------------------
+# Footprint rasters from footRaster() are in absolute projected (UTM)
+# coordinates, NOT tower-centered at x=0,y=0 -- confirmed via a real
+# footRaster() call on ABBY (extent ~549066-555086 E, ~5064861-5070881 N,
+# a square grid centered on the tower). Distance must be measured from the
+# grid's center (the tower), not from the UTM origin.
 footprint_extent <- function(r, threshold = 0.90) {
   df <- as.data.frame(r, xy = TRUE, na.rm = TRUE)
   names(df)[3] <- "val"
   if (nrow(df) == 0 || sum(df$val, na.rm = TRUE) == 0) return(NA_real_)
-  df$dist <- sqrt(df$x^2 + df$y^2)
+  ext_r <- terra::ext(r)
+  cx <- (ext_r[1] + ext_r[2]) / 2
+  cy <- (ext_r[3] + ext_r[4]) / 2
+  df$dist <- sqrt((df$x - cx)^2 + (df$y - cy)^2)
   df <- df[order(-df$val), ]
   df$cum <- cumsum(df$val) / sum(df$val)
   keep <- df[df$cum <= threshold, ]
@@ -49,6 +57,22 @@ parse_layer_time <- function(nm) {
 # process one site-year's worth of files -> one result row
 # process one site-year's worth of files -> one result row
 process_site_year <- function(tower_id, neon_site, lat, lon, yr, data_files) {
+  # store each footRaster() result by writing it to a real temp GeoTIFF and
+  # keeping the file path -- protects against terra's external-pointer
+  # invalidation when SpatRasters are stashed in a list across loop
+  # iterations. NOTE: terra::wrap()/unwrap() was tried for this and confirmed
+  # (via a standalone R reproduction, terra 1.7.65) to silently discard the
+  # raster's cell values on unwrap() while leaving geometry/layer names
+  # intact -- mean() and as.data.frame() then succeed but operate on an
+  # empty raster, producing a silent NA extent with no error. This is
+  # terra-version-specific behavior, not a guarantee for all versions -- if
+  # a future terra upgrade reintroduces wrap()/unwrap() here (e.g. during a
+  # refactor) and this bug resurfaces in a newer/older terra release, the
+  # symptom to watch for is: n_daytime_intervals looks plausible (parsing
+  # and geometry survive), but avg_daytime_extent_m is silently NA with NO
+  # error or warning surfaced in the main loop. Writing to an actual file
+  # and re-reading with rast() does not have this problem and should be
+  # preferred regardless of terra version.
   good_stacks <- list()
   n_skipped <- 0
   for (df in data_files) {
@@ -58,21 +82,23 @@ process_site_year <- function(tower_id, neon_site, lat, lon, yr, data_files) {
       if (frac_valid < placeholder_frac_threshold) {
         stop("placeholder file (footprint data is NaN-filled)")
       }
-      terra::wrap(raw_st)
+      tmp_path <- tempfile(fileext = ".tif")
+      terra::writeRaster(raw_st, tmp_path, overwrite = TRUE)
+      tmp_path
     }, error = function(e) NULL)
     if (!is.null(st)) good_stacks[[length(good_stacks) + 1]] <- st
     else n_skipped <- n_skipped + 1
   }
-  
+
   if (length(good_stacks) == 0) {
     return(tibble(tower_id = tower_id, neon_site = neon_site, year = yr,
                   avg_daytime_extent_m = NA, n_daytime_intervals = 0,
                   n_files_skipped = n_skipped, status = "all files failed"))
   }
-  
-  r_stack <- rast(terra::unwrap(good_stacks[[1]]))
+
+  r_stack <- rast(good_stacks[[1]])
   if (length(good_stacks) > 1) {
-    for (k in 2:length(good_stacks)) r_stack <- c(r_stack, rast(terra::unwrap(good_stacks[[k]])))
+    for (k in 2:length(good_stacks)) r_stack <- c(r_stack, rast(good_stacks[[k]]))
   }
   lyr_names <- names(r_stack)
   keep_idx <- which(!grepl("^mean$", lyr_names, ignore.case = TRUE))
@@ -117,7 +143,13 @@ for (i in seq_len(nrow(towers_df))) {
                           recursive = TRUE, full.names = TRUE)
   if (length(all_files) == 0) next
   
-  file_years <- str_extract(basename(all_files), "(?<=\\.)\\d{4}(?=-\\d{2}\\.)")
+  # NEON eddy-covariance H5 files are published one per DAY (e.g. "...nsae.
+  # 2025-01-01.expanded..."), not one per month. Extract the embedded
+  # YYYY-MM(-DD) date token first, then take its year -- a regex anchored to
+  # "-\\d{2}\\." directly (no day component) never matches these filenames
+  # and silently yields zero files for every site.
+  date_token <- str_extract(basename(all_files), "\\d{4}-\\d{2}(-\\d{2})?")
+  file_years <- substr(date_token, 1, 4)
   years_present <- sort(unique(file_years[!is.na(file_years)]))
   
   for (yr in years_present) {
