@@ -107,21 +107,33 @@ cat("Found", nrow(towers_df), "sites in NEONsites.csv.\n")
 bad_band_ranges <- list(c(300, 400), c(1340, 1445), c(1790, 1955), c(2400, 2600))
 
 read_neon_h5_tile <- function(h5_path) {
-  refl_path <- h5ls(h5_path) %>% filter(str_detect(name, "Reflectance$")) %>% pull(group) %>% unique()
+  # Open this file's handle once and pass it into every h5*() call below,
+  # instead of the path (which rhdf5 would open+close internally per call).
+  # Scoped to this one file/call via on.exit -- never touches any other
+  # file's handles or session-wide HDF5 state. (An earlier version used
+  # h5closeAll() here, which sweeps every currently-open identifier in the
+  # whole R session; that was suspected of leaving rhdf5 in a state that
+  # broke a later, unrelated file's read. Not conclusively reproduced in
+  # testing, but scoped per-file open/close is strictly more precise
+  # regardless and is rhdf5's documented pattern for read loops.)
+  fid <- H5Fopen(h5_path)
+  on.exit(H5Fclose(fid), add = TRUE)
+
+  refl_path <- h5ls(fid) %>% filter(str_detect(name, "Reflectance$")) %>% pull(group) %>% unique()
   site_group <- str_split(refl_path, "/")[[1]][2]
 
-  wavelengths <- h5read(h5_path, paste0("/", site_group, "/Reflectance/Metadata/Spectral_Data/Wavelength"))
-  refl <- h5read(h5_path, paste0("/", site_group, "/Reflectance/Reflectance_Data"))
-  attrs <- h5readAttributes(h5_path, paste0("/", site_group, "/Reflectance/Reflectance_Data"))
+  wavelengths <- h5read(fid, paste0("/", site_group, "/Reflectance/Metadata/Spectral_Data/Wavelength"))
+  refl <- h5read(fid, paste0("/", site_group, "/Reflectance/Reflectance_Data"))
+  attrs <- h5readAttributes(fid, paste0("/", site_group, "/Reflectance/Reflectance_Data"))
   scale_factor <- ifelse(!is.null(attrs$Scale_Factor), attrs$Scale_Factor, 10000)
   no_data <- ifelse(!is.null(attrs$Data_Ignore_Value), attrs$Data_Ignore_Value, -9999)
 
-  map_info <- h5read(h5_path, paste0("/", site_group, "/Reflectance/Metadata/Coordinate_System/Map_Info"))
+  map_info <- h5read(fid, paste0("/", site_group, "/Reflectance/Metadata/Coordinate_System/Map_Info"))
   map_info <- str_split(map_info, ",")[[1]]
   px_size  <- as.numeric(map_info[6])
   x_min    <- as.numeric(map_info[4])
   y_max    <- as.numeric(map_info[5])
-  epsg_code <- h5read(h5_path, paste0("/", site_group, "/Reflectance/Metadata/Coordinate_System/EPSG Code"))
+  epsg_code <- h5read(fid, paste0("/", site_group, "/Reflectance/Metadata/Coordinate_System/EPSG Code"))
 
   refl[refl == no_data] <- NA
   refl <- refl / scale_factor   # -> 0-1 reflectance
@@ -134,12 +146,6 @@ read_neon_h5_tile <- function(h5_path) {
                                y_max - nrow_r * px_size, y_max))
   crs(r) <- paste0("EPSG:", epsg_code)
   names(r) <- paste0("b", round(wavelengths))
-
-  # rhdf5 accumulates open file/dataset identifiers across repeated
-  # h5read()/h5readAttributes() calls; across hundreds of site-year jobs
-  # this exhausts HDF5's handle table and throws an internal
-  # H5IdComponent error. Close everything this call opened before returning.
-  h5closeAll()
 
   list(raster = r, wavelengths = wavelengths)
 }
@@ -160,7 +166,34 @@ mask_bad_bands <- function(r, wavelengths) {
 get_tower_reflectance <- function(tower_id, h5_files, buffer_m) {
   if (length(h5_files) == 0) return(NULL)
 
-  tiles <- map(h5_files, possibly(read_neon_h5_tile, otherwise = NULL))
+  tower_row <- towers_df %>% filter(Site.ID == tower_id)
+  pt <- vect(cbind(tower_row$Lon, tower_row$Lat), crs = "EPSG:4326")
+
+  # Crop each tile to the tower's buffer immediately after reading it, BEFORE
+  # mosaicking, rather than mosaicking all full-resolution tiles together and
+  # cropping once at the end. Holding N full, un-cropped tiles in memory
+  # simultaneously (mosaic-then-crop) is what exhausted memory (std::bad_alloc)
+  # on real multi-tile site-years; crop-then-mosaic never holds more than one
+  # full tile plus a set of already-small, buffer-sized pieces.
+  #
+  # This does not change the result. mask_bad_bands() only selects LAYERS
+  # (by wavelength), never touches spatial extent, so it commutes with
+  # crop/mosaic order regardless of where it runs. And NEON tiles are
+  # grid-aligned and non-overlapping (fixed 1km tiles on a common 1m-pixel
+  # UTM grid), so mosaic() assigns each output cell the value from whichever
+  # single tile covers it -- there is no blending to get wrong. Cropping a
+  # tile to the buffer's bounding box before mosaicking only discards cells
+  # that the old mosaic-then-crop order would also discard in its final
+  # crop(); it cannot change the value of any cell that survives either way.
+  crop_tile_to_buffer <- function(h5_path) {
+    tile <- read_neon_h5_tile(h5_path)
+    pt_proj <- project(pt, crs(tile$raster))
+    buf <- buffer(pt_proj, buffer_m)
+    tile$raster <- crop(tile$raster, buf)
+    tile
+  }
+
+  tiles <- map(h5_files, possibly(crop_tile_to_buffer, otherwise = NULL))
   tiles <- compact(tiles)
   if (length(tiles) == 0) return(NULL)
 
@@ -170,11 +203,11 @@ get_tower_reflectance <- function(tower_id, h5_files, buffer_m) {
 
   masked <- mask_bad_bands(mosaic_r, wavelengths)
 
-  tower_row <- towers_df %>% filter(Site.ID == tower_id)
-  pt <- vect(cbind(tower_row$Lon, tower_row$Lat), crs = "EPSG:4326")
+  # final circular mask + crop -- the pieces are already buffer-bbox-sized,
+  # so this crop is now cheap/near-no-op; the mask() to the circle (rather
+  # than just the bbox) still has to happen once on the assembled mosaic.
   pt_proj <- project(pt, crs(masked$raster))
   buf <- buffer(pt_proj, buffer_m)
-
   cropped <- crop(mask(masked$raster, buf), buf)
   list(raster = cropped, wavelengths = masked$wavelengths)
 }

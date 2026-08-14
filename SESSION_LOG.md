@@ -4,6 +4,62 @@ Committed, dated record of work performed in this repository. Reverse
 chronological order, newest entry at the top. See CLAUDE.md for the
 convention this file follows.
 
+## 2026-08-14 21:10 UTC — Fix std::bad_alloc (crop-then-mosaic) and rhdf5 envRefClass error (scoped H5 handles)
+
+Round 3 of real-data bugfixes. After the CRS/handle-leak fix (previous
+entry), user ran the full pipeline locally against real ABBY 2017/2018 data
+and hit two new failures:
+- 2017: `std::bad_alloc` during read/mosaic/crop
+- 2018: `Called from: is(x, "envRefClass")`
+
+User proposed diagnoses for both and asked for investigation/confirmation
+before changing anything, not blind implementation of the diagnosis.
+
+**Issue 1 (std::bad_alloc) -- investigated and confirmed correct.**
+`get_tower_reflectance()` mosaicked ALL full-resolution tiles together
+before cropping to the 500m buffer, matching memory-exhaustion behavior
+already independently observed earlier this session when attempting a real
+run in this sandbox (holding N full 426-band/1000x1000 tiles simultaneously
+is the actual peak-memory driver). Restructured to crop each tile to the
+buffer's bounding box immediately after reading it, before mosaicking, so
+peak memory never holds more than one full tile plus already-small cropped
+pieces.
+
+Verified equivalence EMPIRICALLY, not just by argument: built 4 synthetic
+grid-aligned, non-overlapping tiles matching the real NEON tile geometry,
+with a buffer point at the hardest case (the 4-way tile corner, drawing from
+all 4 tiles), and ran both the old mosaic-then-crop and new crop-then-mosaic
+sequences. Results were bit-identical: same extent, same dims,
+`identical(values(old), values(new))` = TRUE, max abs diff on non-NA cells =
+0, identical NA-pixel count/pattern (6220 in both).
+
+**Issue 2 (envRefClass) -- investigated, not conclusively reproduced, fixed
+anyway as strictly safer.** Read `rhdf5::h5closeAll()`'s actual source: it
+calls `h5validObjects()` (queries the HDF5 C library for all currently-valid
+identifiers) and closes each individually via `.H5close()` -- it does NOT
+call the library-wide `H5close()` reset, so the specific mechanism proposed
+(closer to a full library reset) isn't quite what the source shows.
+Empirically ran 24 iterations of open/read/close (reusing the 4 real ABBY
+files, `h5closeAll()` after each, mirroring the real loop structure) and did
+not reproduce any handle-corruption error against this sandbox's rhdf5
+2.46.1. Inconclusive -- doesn't rule out the failure at ~183-site-year scale
+or a different rhdf5/HDF5-C build. Implemented the requested fix regardless:
+scoped `H5Fopen()`/`H5Fclose()` per file via `on.exit()` in
+`read_neon_h5_tile()`, replacing the global `h5closeAll()` sweep. Confirmed
+against a real ABBY file first: `h5read()`/`h5readAttributes()`/`h5ls()` all
+accept an open handle in place of a path and can be called repeatedly on it,
+and using the handle after `H5Fclose()` correctly raises `"H5Identifier not
+valid"` (not silent wrong data) -- `on.exit()` also closes the handle on the
+error path, which the old code didn't.
+
+Both files re-sourced cleanly after the edits (stopped only at the expected
+missing `Data/NEONsites.csv` point, no syntax/definition errors). No real
+pipeline run attempted in this sandbox, per standing direction from earlier
+this session.
+
+Applied identically to `Code/AnnualSpectralDiversity.R` and
+`Code/ComputeSpecBiodiv.R`.
+
 ## 2026-08-14 20:30 UTC — Fix missing CRS and rhdf5 handle leak in read_neon_h5_tile()
 
 User ran the full `AnnualSpectralDiversity.R` pipeline locally (real hardware)
