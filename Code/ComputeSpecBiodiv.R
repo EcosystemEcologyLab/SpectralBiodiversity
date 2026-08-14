@@ -73,18 +73,26 @@ read_neon_h5_tile <- function(h5_path) {
   px_size  <- as.numeric(map_info[6])
   x_min    <- as.numeric(map_info[4])
   y_max    <- as.numeric(map_info[5])
-  
+  epsg_code <- h5read(h5_path, paste0("/", site_group, "/Reflectance/Metadata/Coordinate_System/EPSG Code"))
+
   refl[refl == no_data] <- NA
   refl <- refl / scale_factor   # -> 0-1 reflectance
-  
+
   # H5 array dims are (band, col, row); reorder to (row, col, band) for terra
   refl <- aperm(refl, c(3, 2, 1))
   nrow_r <- dim(refl)[1]; ncol_r <- dim(refl)[2]
-  
+
   r <- rast(refl, extent = ext(x_min, x_min + ncol_r * px_size,
                                y_max - nrow_r * px_size, y_max))
+  crs(r) <- paste0("EPSG:", epsg_code)
   names(r) <- paste0("b", round(wavelengths))
-  
+
+  # rhdf5 accumulates open file/dataset identifiers across repeated
+  # h5read()/h5readAttributes() calls; across many site loop iterations
+  # this exhausts HDF5's handle table and throws an internal
+  # H5IdComponent error. Close everything this call opened before returning.
+  h5closeAll()
+
   list(raster = r, wavelengths = wavelengths)
 }
 

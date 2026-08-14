@@ -4,6 +4,58 @@ Committed, dated record of work performed in this repository. Reverse
 chronological order, newest entry at the top. See CLAUDE.md for the
 convention this file follows.
 
+## 2026-08-14 20:30 UTC — Fix missing CRS and rhdf5 handle leak in read_neon_h5_tile()
+
+User ran the full `AnnualSpectralDiversity.R` pipeline locally (real hardware)
+against real ABBY 2017 and 2018 H5 tiles and hit two real errors:
+- 2017: `"[project] output crs is not valid"`
+- 2018: `"Called from: is(h5id, \"H5IdComponent\")"`
+
+Both traced to `read_neon_h5_tile()`, which is shared verbatim between
+`Code/AnnualSpectralDiversity.R` and `Code/ComputeSpecBiodiv.R` (the script it
+was derived from) -- fixed identically in both.
+
+**Bug 1, missing CRS:** `read_neon_h5_tile()` built the SpatRaster via
+`rast(refl, extent = ext(...))` but never called `crs(r) <-`, so
+`crs(masked$raster)` was empty and `project(pt, crs(masked$raster))` in
+`get_tower_reflectance()` had nothing valid to project into. Confirmed
+against a real file (`h5ls` on
+`/ABBY/Reflectance/Metadata/Coordinate_System/`) that an `EPSG Code` dataset
+sits alongside `Map_Info` (also `Proj4` and `Coordinate_System_String`,
+either of which would also work, EPSG was preferred as the more robust
+option across PROJ/terra versions) -- value `32610` (UTM zone 10N),
+consistent across all 4 real tiles checked. Fix: read that dataset and
+`crs(r) <- paste0("EPSG:", epsg_code)` immediately after `rast()`, before the
+raster is ever mosaicked or projected against.
+
+**Bug 2, HDF5 handle leak:** `read_neon_h5_tile()` calls `h5ls()`, `h5read()`
+(x3), and `h5readAttributes()` per file without closing handles; across
+~183 site-year jobs this exhausts rhdf5's internal handle table and throws
+an internal `H5IdComponent` error partway through a long run -- a known
+rhdf5 behavior, not a data problem. Fix: `h5closeAll()` at the end of
+`read_neon_h5_tile()`, before it returns.
+
+Verification (per user's explicit direction -- code review + lightweight
+structural checks against real file metadata, not another full pipeline run,
+since this sandbox cannot complete one; see the entry below):
+- Confirmed the `EPSG Code` field/path against all 4 real ABBY H5 tiles
+  (all `32610`).
+- Confirmed `h5closeAll()` is a real exported function in the installed
+  rhdf5 2.46.1, and ran it successfully both with nothing open and after
+  real `H5Fopen()`/`H5Dopen()` handles were open against a real file.
+- Confirmed the `crs(r) <- paste0("EPSG:", epsg_code)` pattern actually
+  fixes the failure mode: `crs()` is `NA` before the assignment and a valid
+  `32610` after, and `project()` against it succeeds (reproduced the same
+  UTM tower coordinates, ~552103/5067601, computed earlier in this session
+  by other means).
+- Both edited files source cleanly (no syntax/definition errors) with only
+  the library set the scripts already require.
+- Did NOT re-run the full pipeline against real data in this sandbox -- see
+  the memory-exhaustion entry below; that remains something only the user's
+  local machine can do.
+
+Applied to both `Code/AnnualSpectralDiversity.R` and `Code/ComputeSpecBiodiv.R`.
+
 ## 2026-08-14 19:55 UTC — Real ABBY 2017 H5 tiles: structural validation only; full pipeline run not completed (sandbox memory)
 
 User supplied 4 real NEON DP3.30006.001 reflectance H5 tiles for ABBY, 2017
