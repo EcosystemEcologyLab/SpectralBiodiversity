@@ -17,8 +17,10 @@
 #   1. Coefficient of Variation (CV)
 #   2. Convex Hull Volume (CHV), first 3 PCs
 #   3. Spectral Species Richness (RF + K-means, 50 clusters)
-#   4. Rao's Q (NDVI, NIRv, all-bands), via rasterdiv (CRAN), classic
-#      (non-normalized) form -- NOT via pyGNDiv/reticulate. Comparability
+#   4. Rao's Q (NDVI, NIRv, all-bands), classic (non-normalized) form, via a
+#      local per-window implementation (Section 6) -- NOT via
+#      pyGNDiv/reticulate, and NOT via rasterdiv::paRao() (tried first; see
+#      Section 6 for why it doesn't work at this resolution). Comparability
 #      across variable-set sizes (e.g. a 1-band NDVI Q vs. an all-bands Q,
 #      which is what pyGNDiv's generalizable normalization was for) is not
 #      needed here: every comparison in this analysis is across YEARS at the
@@ -47,12 +49,13 @@
 # All H5-reading, spectral-index, and metric-computation helpers below are
 # reused verbatim from ComputeSpecBiodiv.R -- this script only restructures
 # the loop and buffer logic around them -- EXCEPT Rao's Q (Section 6), which
-# uses rasterdiv instead of ComputeSpecBiodiv.R's pyGNDiv approach; see the
-# note above and in Section 6 for why.
+# uses a local per-window R implementation instead of ComputeSpecBiodiv.R's
+# pyGNDiv approach; see the note above and in Section 6 for why.
 #
 # Runtime: dominated by spectral species richness (RF + K-means, n_reps_ssr
-# reps per site-year) and the three Rao's Q rasterdiv calls (one native
-# moving-window pass per variant, no per-window Python round-trip). The 500m
+# reps per site-year) and the three local Rao's Q moving-window passes (one
+# per variant, no per-window Python round-trip and no raster-wide distance
+# matrix). The 500m
 # buffer here is smaller than ComputeSpecBiodiv.R's CV/CHV/SSR buffer (530m,
 # so that part of the cost is about the same) but larger than its Rao Q
 # buffer (300m) -- area scales as radius^2, so each Rao Q variant here covers
@@ -71,7 +74,6 @@ library(cluster)
 library(dplyr)
 library(stringr)
 library(purrr)
-library(rasterdiv)
 library(tibble)
 
 # ============================================================================
@@ -87,7 +89,7 @@ n_subsample_pixels   <- 2500
 n_pc_ssr             <- 4
 n_pc_chv             <- 3
 n_reps_ssr           <- 20
-raoq_window          <- 3   # side of the square moving window passed to rasterdiv::paRao()
+raoq_window          <- 3   # side of the square moving window for local Rao's Q (Section 6)
 
 towers_df <- read.csv("./Data/NEONsites.csv") %>%
   mutate(neon_site = str_extract(Site.Name, "(?<=\\()[A-Za-z0-9]{4}(?=\\)\\s*$)")) %>%
@@ -284,60 +286,113 @@ compute_spectral_species_richness <- function(r, veg_mask, n_clusters = 50,
 }
 
 # ============================================================================
-# 6. Metric 4: Rao's Q via rasterdiv (classic, non-normalized)
+# 6. Metric 4: Rao's Q, local moving-window implementation (no global
+#    distance matrix)
 # ============================================================================
-# ComputeSpecBiodiv.R computes Rao's Q via pyGNDiv/reticulate, whose
-# "generalizable normalization" exists to make Q comparable across variable
-# sets of different sizes (e.g. a 1-band NDVI-derived Q vs. an all-bands Q).
-# This script doesn't need that: every comparison here is across YEARS at
-# the same site, using the SAME variable set (NDVI-only, NIRv-only, or
-# all-bands) each time. So Rao's Q here is computed with rasterdiv (CRAN;
-# Rocchini et al. 2017, Ecological Indicators, describes the original
-# spectralrao() function this package grew out of) via its current public
-# function, paRao(), in the classic (non-normalized) parametric form. This
-# drops the Python/reticulate dependency entirely -- verified against the
-# installed rasterdiv CRAN package (not assumed from the 2017 paper's older
-# spectralrao() signature, which no longer applies).
+# This used to call rasterdiv::paRao() (see git history / SESSION_LOG.md for
+# that version). paRao()'s "classic" and "multidimension" modes both build
+# ONE global pairwise distance matrix across every UNIQUE value in the
+# ENTIRE input raster, then look up each window's result from it. That
+# scales as O(unique_values^2) in memory -- fine for coarse/classified
+# rasters, but for continuous ~1m-resolution reflectance/NDVI data a single
+# site-year raster has hundreds of thousands of near-unique values, and
+# paRao failed outright on ABBY 2017 NDVI (1000x1000, ~750k mostly-unique
+# values even after simplify=4) trying to allocate a >1 TB distance matrix.
+# That's not a tunable-parameter problem -- paRao's design assumption
+# (few unique classes, looked up globally) doesn't match this data.
 #
-# paRao() takes a SpatRaster (or a list of them) directly, no conversion
-# needed. method = "classic" is used for single-layer inputs (NDVI, NIRv);
-# method = "multidimension" for the all-bands case, which paRao requires as
-# a LIST of single-layer SpatRasters rather than one multi-band SpatRaster.
-# alpha = 1 (arithmetic-mean distance weighting) is the classic Rao's Q
-# formulation. dist_m = "euclidean" and window = raoq_window (3x3) match
-# what the pyGNDiv version used.
+# Rao's Q is inherently local: Rocchini et al. (2017) and the classic
+# Botta-Dukat (2005) formulation both define it per moving window, using
+# only that window's own pixel values -- a window's Q never needs distances
+# to pixel values from elsewhere in the raster. The implementation below
+# computes Q per window directly from that window's own (<= window^2) pixel
+# vectors, so memory for the pairwise-distance step is bounded by window^2
+# regardless of total raster size. This is the same window-local approach
+# ComputeSpecBiodiv.R's pyGNDiv-based rao_q_window_pygndiv() /
+# compute_rao_q_raster_pygndiv() used before the (now-reverted) rasterdiv
+# swap, just without the per-window Python/reticulate round-trip.
 #
-# simplify controls how many decimal places of the input are kept before
-# rasterdiv rounds and casts values to integer internally for its distance
-# calculations. Its DEFAULT (simplify = 0) rounds to whole numbers, which
-# silently collapses reflectance/NDVI/NIRv values (all roughly in a 0-1
-# range) to 0 and zeroes out Rao's Q entirely -- confirmed with a synthetic
-# raster during validation. simplify = 4 preserves ~4 decimal places, in
-# line with the original NEON int16 reflectance scale factor (1/10000), and
-# was confirmed to produce non-trivial, non-zero Q values on the same
-# synthetic raster.
+# Formula: classic (non-normalized) Rao's Q, alpha = 1 (arithmetic-mean
+# distance weighting) -- Q = sum_i sum_j p_i * p_j * d_ij, the FULL double
+# sum over all pairs (i, j) including i == j (which contributes 0), NOT
+# divided by 2 (Botta-Dukat 2005 eq. 1; Rocchini et al. 2017 eq. 1). d_ij is
+# Euclidean distance between pixel spectral vectors (1 dimension for
+# NDVI/NIRv, n_bands dimensions for all-bands). rao_q_window() below
+# computes this as sum(D) / n^2 over the window's own n (<= window^2)
+# pixels with equal weight p_i = 1/n each -- algebraically identical to the
+# textbook sum_i sum_j p_i*p_j*d_ij (duplicate pixel values need no special
+# handling: repeating an identical value k times and weighting it 1/n each
+# is the same sum as giving it weight k/n once).
 #
-# NA handling: veg_mask-excluded pixels arrive as NA. rasterdiv emits a
-# warning claiming NAs "will be treated as 0s", but that text is stale for
-# this code path -- its internal distance function propagates NA per pixel
-# pair and the window aggregation sums with na.rm = TRUE, so NA pixels are
-# excluded from the distance calculation, not substituted with a value. This
-# was verified empirically: a homogeneous synthetic raster with an NA hole
-# in the middle returns near-zero Q everywhere (as expected for a
-# genuinely homogeneous raster), not the large spurious Q that would appear
-# at the hole's edge if NA were actually being treated as 0.
-compute_rao_q_raster_rasterdiv <- function(feature_r, window = 3, dist_m = "euclidean", simplify = 4) {
-  if (nlyr(feature_r) == 1) {
-    res <- paRao(x = feature_r, window = window, alpha = 1, method = "classic",
-                dist_m = dist_m, na.tolerance = 1, rasterOut = TRUE,
-                simplify = simplify, np = 1, progBar = FALSE)
-  } else {
-    band_list <- lapply(seq_len(nlyr(feature_r)), function(i) feature_r[[i]])
-    res <- paRao(x = band_list, window = window, alpha = 1, method = "multidimension",
-                dist_m = dist_m, na.tolerance = 1, rasterOut = TRUE,
-                simplify = simplify, np = 1, progBar = FALSE)
-  }
-  mean(values(res[[1]][[1]]), na.rm = TRUE)
+# Windows are non-overlapping (stride = window), matching the tiling the
+# pyGNDiv version used, and the per-window Q values are averaged for the
+# site-year result, matching how the rasterdiv version aggregated
+# (mean(values(...), na.rm = TRUE)). Incomplete windows at the raster's
+# bottom/right edge are dropped rather than padded, same as the pyGNDiv
+# version's row_centers/col_centers behavior.
+#
+# Vectorization: terra::focal() and terra::focalValues() were evaluated and
+# rejected for the all-bands case -- confirmed empirically against a
+# synthetic 2-layer SpatRaster that focalValues() silently returns only the
+# FIRST layer's window values, and focal() applies its function per-layer
+# independently, so neither can hand one function call a pixel's window
+# values across ALL bands together, which all-bands Rao's Q needs (distance
+# is computed jointly across bands, not layer-by-layer). Instead, every
+# window's pixel-cell indices are computed in ONE vectorized
+# cellFromRowCol() call up front (not recomputed per window, unlike the old
+# pygndiv version's per-window call inside its loop), and feature_r's values
+# matrix is extracted once. The remaining per-window loop does O(window^2)
+# work on values already resident in memory -- no per-window disk I/O, no
+# per-window Python call, and no raster-wide distance matrix. Benchmarked on
+# synthetic 1000x1000 rasters: ~5s for a single-layer (NDVI/NIRv) pass, and
+# runtime for the all-bands case scales with band count via each window's
+# dist() call (~350 bands, 500x500: ~6s; scales roughly linearly with pixel
+# count from there) -- on the order of tens of seconds to low minutes per
+# site-year for all three Rao's Q variants combined, well under the cost of
+# the spectral-species-richness step (RF + K-means, n_reps_ssr reps) above.
+rao_q_window <- function(window_vals) {
+  window_vals <- window_vals[stats::complete.cases(window_vals), , drop = FALSE]
+  n <- nrow(window_vals)
+  if (n < 2) return(NA_real_)
+  D <- as.matrix(stats::dist(window_vals, method = "euclidean"))
+  sum(D) / (n * n)
+}
+
+compute_rao_q_raster_local <- function(feature_r, window = 3) {
+  stopifnot(window %% 2 == 1)
+  half <- window %/% 2
+  nr <- nrow(feature_r); nc <- ncol(feature_r)
+  if (nr < window || nc < window) return(NA_real_)
+
+  row_centers <- seq(half + 1, nr - half, by = window)
+  col_centers <- seq(half + 1, nc - half, by = window)
+  n_row <- length(row_centers); n_col <- length(col_centers)
+  if (n_row == 0 || n_col == 0) return(NA_real_)
+
+  # offsets of the window^2 positions within a window, relative to its center
+  off <- (-half):half
+  row_off <- rep(off, times = window)
+  col_off <- rep(off, each  = window)
+
+  # every window's center, repeated once per within-window offset -- lets a
+  # single vectorized cellFromRowCol() call resolve cell indices for ALL
+  # windows at once instead of once per window
+  centers_row <- rep(row_centers, times = n_col)
+  centers_col <- rep(col_centers, each  = n_row)
+  n_windows <- length(centers_row)
+
+  cell_rows <- outer(row_off, centers_row, "+")   # window^2 x n_windows
+  cell_cols <- outer(col_off, centers_col, "+")   # window^2 x n_windows
+  cell_idx  <- cellFromRowCol(feature_r, as.vector(cell_rows), as.vector(cell_cols))
+  dim(cell_idx) <- c(window * window, n_windows)
+
+  vals_all <- values(feature_r)   # ncell x nlyr, extracted once
+
+  raoq_vals <- vapply(seq_len(n_windows), function(w) {
+    rao_q_window(vals_all[cell_idx[, w], , drop = FALSE])
+  }, numeric(1))
+
+  mean(raoq_vals, na.rm = TRUE)
 }
 
 # ============================================================================
@@ -458,12 +513,12 @@ for (j in seq_along(site_year_jobs)) {
       ssr_val <- compute_spectral_species_richness(r, veg_mask, n_clusters,
                                                     n_subsample_pixels, n_pc_ssr, n_reps_ssr)
 
-      cat("  computing Rao Q (NDVI) via rasterdiv...\n")
-      raoq_ndvi <- compute_rao_q_raster_rasterdiv(mask(ndvi, veg_mask), raoq_window)
-      cat("  computing Rao Q (NIRv) via rasterdiv...\n")
-      raoq_nirv <- compute_rao_q_raster_rasterdiv(mask(nirv, veg_mask), raoq_window)
-      cat("  computing Rao Q (all bands) via rasterdiv...\n")
-      raoq_all  <- compute_rao_q_raster_rasterdiv(mask(r, veg_mask), raoq_window)
+      cat("  computing Rao Q (NDVI), local moving-window...\n")
+      raoq_ndvi <- compute_rao_q_raster_local(mask(ndvi, veg_mask), raoq_window)
+      cat("  computing Rao Q (NIRv), local moving-window...\n")
+      raoq_nirv <- compute_rao_q_raster_local(mask(nirv, veg_mask), raoq_window)
+      cat("  computing Rao Q (all bands), local moving-window...\n")
+      raoq_all  <- compute_rao_q_raster_local(mask(r, veg_mask), raoq_window)
 
       status <- if (tower_id %in% single_year_tower_ids) "success (single-year site)" else "success"
 

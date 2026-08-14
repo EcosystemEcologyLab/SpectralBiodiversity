@@ -4,6 +4,71 @@ Committed, dated record of work performed in this repository. Reverse
 chronological order, newest entry at the top. See CLAUDE.md for the
 convention this file follows.
 
+## 2026-08-14 21:45 UTC — Replace rasterdiv Rao's Q with local moving-window implementation (fixes std::bad_alloc)
+
+`rasterdiv::paRao()` (introduced two sessions ago, see the 18:57 UTC entry
+below) failed with `cannot allocate vector of size 1077.6 Gb` on ABBY 2017's
+NDVI layer (1000x1000, ~750k mostly-unique continuous values even after
+`simplify=4`). Root cause, not a tunable-parameter problem: paRao's
+classic/multidimension modes build ONE global pairwise distance matrix
+across every unique value in the WHOLE input raster, then look up
+per-window results from it -- O(unique_values^2) memory. That's fine for
+coarse/classified rasters but explodes for continuous ~1m-resolution
+reflectance/NDVI data with hundreds of thousands of near-unique values.
+paRao's design assumption doesn't match this use case; rasterdiv is
+abandoned here entirely (dropped `library(rasterdiv)`).
+
+Replaced `compute_rao_q_raster_rasterdiv()` in `Code/AnnualSpectralDiversity.R`
+with `compute_rao_q_raster_local()` (+ helper `rao_q_window()`): a genuinely
+local moving-window implementation that computes Rao's Q using ONLY each
+window's own pixel values, the same approach `ComputeSpecBiodiv.R`'s
+pyGNDiv-based `rao_q_window_pygndiv()`/`compute_rao_q_raster_pygndiv()` used
+before the rasterdiv swap, minus the per-window Python/reticulate round-trip.
+`ComputeSpecBiodiv.R` itself still uses the pyGNDiv approach (never had a
+rasterdiv-based function), so it needed no change.
+
+Formula: classic (non-normalized) Rao's Q, Q = sum_i sum_j p_i*p_j*d_ij, the
+full double sum over all pairs (Botta-Dukat 2005 eq. 1; Rocchini et al. 2017
+eq. 1), not divided by 2. Implemented as `sum(D) / n^2` over a window's own
+n (<= window^2) pixels with equal weight 1/n each -- algebraically identical
+to the textbook double sum (duplicates need no special dedup step: repeating
+a value k times and weighting 1/n each equals weighting it k/n once).
+Verified this equivalence against a brute-force nested-loop reference
+implementation, exact match to floating-point precision.
+
+Vectorization: evaluated `terra::focal()`/`focalValues()` first and rejected
+them for the all-bands case -- confirmed empirically (synthetic 2-layer
+SpatRaster) that `focalValues()` silently returns only the FIRST layer's
+window values, and `focal()` applies its function per-layer independently;
+neither can hand one function call a pixel's window values across ALL bands
+jointly, which all-bands Rao's Q needs. Instead, every window's pixel-cell
+indices are computed in one vectorized `cellFromRowCol()` call up front
+(not recomputed per window like the old pygndiv loop), and the raster's
+values matrix is extracted once; the remaining per-window loop does
+O(window^2) work on values already resident in memory.
+
+Verified via the same synthetic-raster standard as the rasterdiv version:
+a homogeneous region returns near-zero Q, a region straddling a sharp
+reflectance boundary returns clearly elevated Q (0.00095 vs. 0.0444 in the
+test raster), and a homogeneous raster with an NA hole (vegetation-mask
+exclusion) returns ~0 everywhere, confirming NA pixels are excluded from
+window distance calculations rather than substituted. Multi-band case also
+confirmed to return Q > 0 on random synthetic data. All four checks reran
+successfully directly against the functions as committed in
+`Code/AnnualSpectralDiversity.R` (not just the prototype), ruling out
+transcription drift.
+
+Memory/complexity reasoning: `rao_q_window()`'s distance matrix is at most
+window^2 x window^2 (9x9 for the default 3x3 window) regardless of total
+raster size -- structurally impossible to reproduce paRao's O(unique^2)
+blowup, since no step anywhere builds a distance matrix over more than one
+window's own pixels at a time. Performance sanity check on synthetic
+1000x1000 rasters: ~5s for a single-layer (NDVI/NIRv) pass; the all-bands
+case scales with band count via each window's `dist()` call (~350 bands,
+500x500: ~6s, extrapolating to tens of seconds at 1000x1000) -- well under
+the cost of the spectral-species-richness step (RF + K-means, `n_reps_ssr`
+reps) that already dominates this script's runtime.
+
 ## 2026-08-14 21:10 UTC — Fix std::bad_alloc (crop-then-mosaic) and rhdf5 envRefClass error (scoped H5 handles)
 
 Round 3 of real-data bugfixes. After the CRS/handle-leak fix (previous
