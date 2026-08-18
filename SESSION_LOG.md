@@ -4,6 +4,29 @@ Committed, dated record of work performed in this repository. Reverse
 chronological order, newest entry at the top. See CLAUDE.md for the
 convention this file follows.
 
+## 2026-08-18 21:49 UTC — Fix veg_mask no-op (mask() requires NA, not FALSE/0)
+
+Fixed the veg-mask bug flagged in the previous entry, in both scripts, at
+all three construction sites (`AnnualSpectralDiversity.R`'s `veg_mask`;
+`ComputeSpecBiodiv.R`'s `veg_mask` and `veg300`): `veg_mask <- ndvi >
+ndvi_thresh` (logical 0/1, no NAs) replaced with `veg_mask <- ifel(ndvi >
+ndvi_thresh, 1, NA)`. `terra::mask(x, mask)` only excludes cells where
+`mask` is `NA` (default `maskvalues = NA`) -- a comment was added at each
+site flagging this non-obvious requirement so it isn't silently
+reintroduced.
+
+Confirmed empirically, not just by code inspection: on a synthetic 20x20
+raster with a deterministic NDVI split (200 cells above threshold, 200
+below), `mask(data_r, veg_mask)` with the old construction left all
+400/400 cells non-NA (confirming the no-op); with the fix, exactly
+200/400 cells (the above-threshold ones) survived.
+
+This is a correctness fix, not a feature. Every metric produced by either
+script before this commit (CV, CHV, SSR, all Rao's Q variants, including
+everything from the two prior entries in this log) was computed over the
+FULL raster extent, not the vegetated subset, and is not directly
+comparable to output produced from this point forward.
+
 ## 2026-08-18 21:39 UTC — PCA-reduced all-bands Rao's Q, spectral Shannon's H', and a pre-existing veg-mask no-op found during validation
 
 `AnnualSpectralDiversity.R`: added PCA-based band reduction ahead of the
