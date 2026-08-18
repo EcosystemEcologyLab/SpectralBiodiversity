@@ -105,7 +105,7 @@ n_reps_ssr           <- 20
 raoq_window          <- 3   # side of the square moving window for local Rao's Q (Section 6)
 raoq_pca_var_threshold <- 0.99   # variance fraction to retain when PCA-reducing all-bands Rao's Q (Section 6a)
 
-towers_df <- read.csv("./Data/NEONsites.csv") %>%
+towers_df <- read.csv("./Data/NEONsites.csv", fileEncoding = "UTF-8-BOM") %>%
   mutate(neon_site = str_extract(Site.Name, "(?<=\\()[A-Za-z0-9]{4}(?=\\)\\s*$)")) %>%
   filter(!is.na(neon_site))
 
