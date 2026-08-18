@@ -4,6 +4,53 @@ Committed, dated record of work performed in this repository. Reverse
 chronological order, newest entry at the top. See CLAUDE.md for the
 convention this file follows.
 
+## 2026-08-18 21:39 UTC — PCA-reduced all-bands Rao's Q, spectral Shannon's H', and a pre-existing veg-mask no-op found during validation
+
+`AnnualSpectralDiversity.R`: added PCA-based band reduction ahead of the
+all-bands Rao's Q call only (`pca_reduce_raster()`, Section 6a) --
+`prcomp()` on the masked pixel x band matrix (center = TRUE, scale. =
+FALSE, matching the CHV/SSR convention), keeping the leading PCs that
+explain >=99% variance (`raoq_pca_var_threshold`), N data-driven per
+site-year since band count varies after bad-band masking. NDVI/NIRv Rao's
+Q are unchanged (already 1-D). `raoq_allbands` going forward is therefore
+not numerically comparable to earlier full-band runs (e.g. earlier ABBY
+test runs, or the rasterdiv-era output) -- flagged in the file header.
+
+Also added spectral Shannon's index H' and its Hill-number effective
+diversity exp(H') (Wang et al. 2018, RSE 211:218-228, Table 2) to
+`compute_spectral_species_richness()`, reusing the existing per-rep
+classifier output rather than reclassifying. The function's return type
+changed from a scalar to a named list (`richness`, `shannon_h`,
+`shannon_effective`); Section 8's call site and the results tibble
+(new `shannon_h`, `shannon_effective` columns) were updated to unpack all
+three. Applied the same H' addition to `ComputeSpecBiodiv.R`, whose
+`compute_spectral_species_richness()` is identical -- its Rao's Q is a
+separate pyGNDiv-based implementation and was left untouched.
+
+`hyperspec_dir`/`out_csv` in `AnnualSpectralDiversity.R` repointed from
+this session's prior `X:/moore/SpectralBiodiversity/...` to
+`D:/projects/moore/SpectralBiodiversity/Data/...` per this run's server
+working directory; the one other hardcoded-looking path
+(`./Data/NEONsites.csv`) was already relative and needed no change.
+
+Synthetic validation (no server data access from this environment): PCA
+reduction confirmed to pick a data-driven, much-smaller-than-input N
+matching an independent recomputation of the 99% threshold, with correct
+NA propagation through masked cells and a finite non-degenerate Rao's Q
+on the reduced raster; Shannon's H'/exp(H') matched hand-calculated values
+exactly for a known class distribution, including correct handling of
+unused factor levels (avoiding 0*ln(0) = NaN); the three-value interface
+change was confirmed to unpack correctly end-to-end at the call site.
+
+Also found, while building the veg-mask test raster for validation: both
+scripts' `mask(r, veg_mask)` calls, everywhere they occur, are a no-op.
+`terra::mask(x, mask)` only masks cells where `mask` is `NA` (default
+`maskvalues = NA`), but `veg_mask <- ndvi > ndvi_thresh` produces a 0/1
+logical raster with no NAs -- confirmed empirically. This predates this
+session's changes and affects every metric (CV, CHV, SSR, all three Rao's
+Q variants) in both scripts; left unfixed as out of scope for this task
+and flagged here for a deliberate follow-up.
+
 ## 2026-08-14 21:45 UTC — Replace rasterdiv Rao's Q with local moving-window implementation (fixes std::bad_alloc)
 
 `rasterdiv::paRao()` (introduced two sessions ago, see the 18:57 UTC entry
