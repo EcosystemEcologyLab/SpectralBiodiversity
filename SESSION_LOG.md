@@ -4,6 +4,63 @@ Committed, dated record of work performed in this repository. Reverse
 chronological order, newest entry at the top. See CLAUDE.md for the
 convention this file follows.
 
+## 2026-08-18 23:11 UTC — Add FieldDiversity.R (field floristic diversity, plot-scope x flight-timing comparison)
+
+New script, `Code/DataAnalysis/FieldDiversity.R`. Computes Hill-Shannon
+(abundance-weighted, q=1, via hillR) and gamma presence richness from NEON
+field percent-cover/presence data (`div_1m2Data.csv`,
+`div_10m2Data100m2Data.csv`) per tower-year, crossed with two independent
+axes: `plot_scope` (`tower` only vs. `tower`+`distributed` combined) and
+`temporal_scope` (`per_bout`, every field bout with no selection, vs.
+`peak_flight`, the one bout whose median plot end date falls nearest the
+site's AOP flight date, within a 30-day tolerance).
+
+Before writing any date-matching logic, investigated the real HDF5
+structure of an actual DP3.30006 reflectance tile (the user uploaded one,
+`NEON_D16_ABBY_DP3_551000_5067000_reflectance.h5`, ABBY 2017) rather than
+assuming the layout from memory, per the task's explicit instruction.
+Finding: there is no acquisition-date attribute anywhere on the file, site
+group, `/Reflectance` group, or `/Reflectance/Reflectance_Data` dataset,
+and the `Metadata/Logs/<flightline>` group name is only the flight line's
+HHMMSS time-of-day, not a date. The date is recoverable only from the TEXT
+CONTENT of `Metadata/Logs/<flightline>/ATCOR_Input_file` -- either an
+embedded `<YYYYMMDD>_<flightline_id>` token or its own literal
+`"22\06\2017          Date (dd/mm/year)"` header line (backslash-delimited,
+not `/`). Both independently resolved to the correct date (2017-06-22) on
+the real file. `get_flight_acquisition_date()` tries the embedded-token
+form first (tied to the exact flightline opened) and falls back to the
+header line, `stop()`-ing with a clear message if neither parses rather
+than guessing. The script also re-runs this investigation live at the top
+of every execution and prints what it finds, so the confirmed structure is
+visible in the console on every real run, not just asserted in comments.
+
+Two access blockers hit before the user's upload: no `.h5` file on disk in
+this sandbox was the right product (the only local one was an unrelated
+DP4.00200.001 eddy-covariance bundle), and NEON's `/api/v0/data/...`
+endpoints 403'd from this sandbox's egress IP (confirmed via both curl and
+R's httr, `/products/` endpoint unaffected) -- ruled out before asking the
+user for a file directly.
+
+Validated end-to-end against a synthetic fixture (real `Data/` field CSVs
+aren't available in this sandbox) built to exercise every branch: the real
+uploaded tile for flight-date resolution, one site/two bouts/three plots
+(tower + distributed) for the metrics, plus a second site with no
+hyperspec coverage and an out-of-range bout. Confirmed: peak_flight
+correctly selects the in-tolerance bout and skips the 52-day-away one;
+`floristic_richness(all) >= floristic_richness(tower)` holds; Hill-Shannon
+mean and `hill_taxa_parti()` gamma matched hand-computed values; richness
+never fell below the max single-plot richness (sanity floor); "no data"
+and "no flight date" grid rows populate correctly instead of being
+dropped. hillR (not previously installed anywhere in this environment)
+was installed from CRAN to confirm its actual exported API
+(`hill_taxa`, `hill_taxa_parti` returning a `TD_gamma` column) rather than
+assuming function/argument names from memory.
+
+Committed (`732632a`). Not run against real `Data/` field CSVs or the `D:`
+drive hyperspec archive -- that first real run, and its console output
+(Step 1 investigation, peak-flight inventory, spot check), still needs
+doing on the actual server.
+
 ## 2026-08-18 21:49 UTC — Fix veg_mask no-op (mask() requires NA, not FALSE/0)
 
 Fixed the veg-mask bug flagged in the previous entry, in both scripts, at
