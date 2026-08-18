@@ -344,7 +344,10 @@ for (i in seq_len(nrow(towers_df))) {
   r <- data_530$raster; wl <- data_530$wavelengths
   
   ndvi <- compute_ndvi_raster(r, wl)
-  veg_mask <- ndvi > ndvi_thresh
+  # terra::mask(r, veg_mask) only excludes cells where veg_mask is NA
+  # (default maskvalues = NA) -- a logical/0-1 raster (e.g. ndvi >
+  # ndvi_thresh) has no NAs and masks nothing. Must be 1/NA, not TRUE/FALSE.
+  veg_mask <- ifel(ndvi > ndvi_thresh, 1, NA)
   
   cat("  computing CV...\n");  cv_val  <- compute_cv(r, veg_mask)
   cat("  computing CHV...\n"); chv_val <- compute_chv(r, veg_mask, n_pc_chv)
@@ -362,7 +365,10 @@ for (i in seq_len(nrow(towers_df))) {
     r300 <- data_300$raster; wl300 <- data_300$wavelengths
     ndvi300 <- compute_ndvi_raster(r300, wl300)
     nirv300 <- compute_nirv_raster(r300, wl300)
-    veg300  <- ndvi300 > ndvi_thresh
+    # terra::mask(r, veg_mask) only excludes cells where veg_mask is NA
+    # (default maskvalues = NA) -- a logical/0-1 raster (e.g. ndvi300 >
+    # ndvi_thresh) has no NAs and masks nothing. Must be 1/NA, not TRUE/FALSE.
+    veg300  <- ifel(ndvi300 > ndvi_thresh, 1, NA)
     
     cat("  computing Rao Q (NDVI) via pyGNDiv...\n")
     raoq_ndvi <- compute_rao_q_raster_pygndiv(mask(ndvi300, veg300), raoq_window, raoq_stride)

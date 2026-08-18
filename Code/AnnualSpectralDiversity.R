@@ -578,7 +578,10 @@ for (j in seq_along(site_year_jobs)) {
 
       ndvi <- compute_ndvi_raster(r, wl)
       nirv <- compute_nirv_raster(r, wl)
-      veg_mask <- ndvi > ndvi_thresh
+      # terra::mask(r, veg_mask) only excludes cells where veg_mask is NA
+      # (default maskvalues = NA) -- a logical/0-1 raster (e.g. ndvi >
+      # ndvi_thresh) has no NAs and masks nothing. Must be 1/NA, not TRUE/FALSE.
+      veg_mask <- ifel(ndvi > ndvi_thresh, 1, NA)
 
       cat("  computing CV...\n");  cv_val  <- compute_cv(r, veg_mask)
       cat("  computing CHV...\n"); chv_val <- compute_chv(r, veg_mask, n_pc_chv)
