@@ -202,34 +202,51 @@ compute_chv <- function(r, veg_mask, n_pc = 3) {
 }
 
 # ============================================================================
-# 5. Metric 3: Spectral Species Richness
+# 5. Metric 3: Spectral Species Richness, plus spectral Shannon's index H'
+#    and its Hill-number effective diversity exp(H') (Wang et al. 2018,
+#    Remote Sensing of Environment 211:218-228, Table 2), reusing the SAME
+#    per-rep classifier output -- NOT a separate classification pass.
 # ============================================================================
+# Returns a named list, not a single scalar: list(richness, shannon_h,
+# shannon_effective). Every call site MUST unpack all three (see Section 7).
 compute_spectral_species_richness <- function(r, veg_mask, n_clusters = 50,
                                               n_subsample = 2500, n_pc = 4,
                                               n_reps = 20) {
   r_masked <- mask(r, veg_mask)
   vals <- values(r_masked, na.rm = TRUE)
   if (nrow(vals) < n_subsample) n_subsample <- nrow(vals)
-  if (nrow(vals) < n_clusters) return(NA_real_)
-  
+  if (nrow(vals) < n_clusters) {
+    return(list(richness = NA_real_, shannon_h = NA_real_, shannon_effective = NA_real_))
+  }
+
   pca <- prcomp(vals, center = TRUE, scale. = FALSE)
   pcs_all <- pca$x[, 1:n_pc]
-  
+
   richness_reps <- numeric(n_reps)
+  shannon_reps  <- numeric(n_reps)
   for (rep_i in seq_len(n_reps)) {
     sub_idx <- sample(seq_len(nrow(pcs_all)), n_subsample)
     pcs_sub <- pcs_all[sub_idx, ]
-    
+
     rf <- randomForest(x = pcs_sub, ntree = 500, proximity = TRUE)
     prox_dist <- as.dist(1 - rf$proximity)
     km <- kmeans(cmdscale(prox_dist, k = n_pc), centers = n_clusters, nstart = 10)
-    
+
     classifier <- randomForest(x = pcs_sub, y = as.factor(km$cluster), ntree = 500)
     pred_all <- predict(classifier, newdata = pcs_all)
-    
+
     richness_reps[rep_i] <- length(unique(pred_all))
+
+    # H' = -sum(p_i * ln(p_i)); table() reports zero-count factor levels
+    # explicitly, so drop them before the sum (0*ln(0) is NaN in R, not the
+    # mathematical convention's 0).
+    tbl <- table(pred_all)
+    p_i <- as.numeric(tbl[tbl > 0]) / length(pred_all)
+    shannon_reps[rep_i] <- -sum(p_i * log(p_i))
   }
-  mean(richness_reps)
+  list(richness = mean(richness_reps),
+       shannon_h = mean(shannon_reps),
+       shannon_effective = mean(exp(shannon_reps)))
 }
 
 # ============================================================================
@@ -300,7 +317,8 @@ compute_rao_q_raster_pygndiv <- function(feature_r, window = 3, stride = window)
 # ============================================================================
 results <- tibble(
   tower_id = character(), neon_site = character(),
-  cv = double(), chv = double(), spectral_species_richness = double(),
+  cv = double(), chv = double(),
+  spectral_species_richness = double(), shannon_h = double(), shannon_effective = double(),
   raoq_ndvi = double(), raoq_nirv = double(), raoq_allbands = double(),
   status = character()
 )
@@ -317,7 +335,8 @@ for (i in seq_len(nrow(towers_df))) {
                        error = function(e) { cat("  read failed:", conditionMessage(e), "\n"); NULL })
   if (is.null(data_530)) {
     results <- add_row(results, tower_id = tower_id, neon_site = neon_site,
-                       cv = NA, chv = NA, spectral_species_richness = NA,
+                       cv = NA, chv = NA,
+                       spectral_species_richness = NA, shannon_h = NA, shannon_effective = NA,
                        raoq_ndvi = NA, raoq_nirv = NA, raoq_allbands = NA,
                        status = "no reflectance data")
     next
@@ -329,9 +348,12 @@ for (i in seq_len(nrow(towers_df))) {
   
   cat("  computing CV...\n");  cv_val  <- compute_cv(r, veg_mask)
   cat("  computing CHV...\n"); chv_val <- compute_chv(r, veg_mask, n_pc_chv)
-  cat("  computing spectral species richness (", n_reps_ssr, "reps)...\n")
-  ssr_val <- compute_spectral_species_richness(r, veg_mask, n_clusters,
+  cat("  computing spectral species richness + Shannon's H' (", n_reps_ssr, "reps)...\n")
+  ssr_result <- compute_spectral_species_richness(r, veg_mask, n_clusters,
                                                n_subsample_pixels, n_pc_ssr, n_reps_ssr)
+  ssr_val         <- ssr_result$richness
+  shannon_h_val   <- ssr_result$shannon_h
+  shannon_eff_val <- ssr_result$shannon_effective
   
   # ---- 300m buffer: Rao Q (NDVI, NIRv, all-bands) via pyGNDiv ----
   data_300 <- tryCatch(get_tower_reflectance(tower_id, buffer_raoq_m),
@@ -353,7 +375,8 @@ for (i in seq_len(nrow(towers_df))) {
   }
   
   results <- add_row(results, tower_id = tower_id, neon_site = neon_site,
-                     cv = cv_val, chv = chv_val, spectral_species_richness = ssr_val,
+                     cv = cv_val, chv = chv_val,
+                     spectral_species_richness = ssr_val, shannon_h = shannon_h_val, shannon_effective = shannon_eff_val,
                      raoq_ndvi = raoq_ndvi, raoq_nirv = raoq_nirv, raoq_allbands = raoq_all,
                      status = "success")
 }

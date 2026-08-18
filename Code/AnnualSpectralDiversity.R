@@ -27,6 +27,19 @@
 #      same site, using the same variable set each time. A hypothetical
 #      future analysis that compared Rao's Q *across index types* directly
 #      would need that normalization back; this one doesn't.
+#      The all-bands variant is additionally PCA-reduced before Rao's Q is
+#      computed (Section 6a) -- raoq_allbands measures Rao's Q on the
+#      dominant ~N axes of spectral variation (99% variance, N data-driven
+#      per site-year), not literally every band, consistent with how
+#      CHV/SSR already reduce dimensionality via PCA. Earlier full-band
+#      Rao's Q numbers (e.g. earlier ABBY test runs, or the rasterdiv-era
+#      output) are NOT numerically comparable to this version's
+#      raoq_allbands.
+#   5. Spectral Shannon's index (H') and its Hill-number effective diversity
+#      (exp(H'), Wang et al. 2018, Remote Sensing of Environment 211:218-228,
+#      Table 2), computed from the same spectral-species cluster assignments
+#      spectral species richness already produces (Section 5) -- no separate
+#      classification step.
 #
 # Differences from ComputeSpecBiodiv.R:
 #   - a single fixed 500m buffer is used for ALL FOUR metrics. The original
@@ -79,8 +92,8 @@ library(tibble)
 # ============================================================================
 # 0. Setup
 # ============================================================================
-hyperspec_dir <- "X:/moore/SpectralBiodiversity/Data/NEON_Hyperspec"
-out_csv       <- "X:/moore/SpectralBiodiversity/Data/spectral_diversity_by_year.csv"
+hyperspec_dir <- "D:/projects/moore/SpectralBiodiversity/Data/NEON_Hyperspec"
+out_csv       <- "D:/projects/moore/SpectralBiodiversity/Data/spectral_diversity_by_year.csv"
 
 buffer_m           <- 500   # single buffer for ALL metrics (CV, CHV, SSR, RaoQ x3)
 ndvi_thresh         <- 0.4
@@ -90,6 +103,7 @@ n_pc_ssr             <- 4
 n_pc_chv             <- 3
 n_reps_ssr           <- 20
 raoq_window          <- 3   # side of the square moving window for local Rao's Q (Section 6)
+raoq_pca_var_threshold <- 0.99   # variance fraction to retain when PCA-reducing all-bands Rao's Q (Section 6a)
 
 towers_df <- read.csv("./Data/NEONsites.csv") %>%
   mutate(neon_site = str_extract(Site.Name, "(?<=\\()[A-Za-z0-9]{4}(?=\\)\\s*$)")) %>%
@@ -255,20 +269,32 @@ compute_chv <- function(r, veg_mask, n_pc = 3) {
 }
 
 # ============================================================================
-# 5. Metric 3: Spectral Species Richness (reused from ComputeSpecBiodiv.R)
+# 5. Metric 3: Spectral Species Richness (reused from ComputeSpecBiodiv.R),
+#    plus spectral Shannon's index H' and its Hill-number effective
+#    diversity exp(H'), reusing the SAME per-rep classifier output --
+#    NOT a separate classification pass.
 # ============================================================================
+# Returns a named list, not a single scalar: list(richness, shannon_h,
+# shannon_effective). Every call site MUST unpack all three (see Section 8)
+# -- treating the return value as a bare number will silently coerce the
+# list's first element only in some contexts and error in others, rather
+# than doing the wrong thing quietly, but don't rely on that; unpack
+# explicitly.
 compute_spectral_species_richness <- function(r, veg_mask, n_clusters = 50,
                                               n_subsample = 2500, n_pc = 4,
                                               n_reps = 20) {
   r_masked <- mask(r, veg_mask)
   vals <- values(r_masked, na.rm = TRUE)
   if (nrow(vals) < n_subsample) n_subsample <- nrow(vals)
-  if (nrow(vals) < n_clusters) return(NA_real_)
+  if (nrow(vals) < n_clusters) {
+    return(list(richness = NA_real_, shannon_h = NA_real_, shannon_effective = NA_real_))
+  }
 
   pca <- prcomp(vals, center = TRUE, scale. = FALSE)
   pcs_all <- pca$x[, 1:n_pc]
 
   richness_reps <- numeric(n_reps)
+  shannon_reps  <- numeric(n_reps)
   for (rep_i in seq_len(n_reps)) {
     sub_idx <- sample(seq_len(nrow(pcs_all)), n_subsample)
     pcs_sub <- pcs_all[sub_idx, ]
@@ -281,8 +307,20 @@ compute_spectral_species_richness <- function(r, veg_mask, n_clusters = 50,
     pred_all <- predict(classifier, newdata = pcs_all)
 
     richness_reps[rep_i] <- length(unique(pred_all))
+
+    # Spectral Shannon's index (Wang et al. 2018, RSE 211:218-228, Table 2):
+    # H' = -sum(p_i * ln(p_i)) over the proportion of pixels assigned to
+    # each spectral-species cluster. table() on a factor reports zero-count
+    # levels explicitly (classifier factor levels the subsample never
+    # predicted) -- drop those before the sum, since 0*ln(0) is NaN in R,
+    # not the mathematical convention's 0.
+    tbl <- table(pred_all)
+    p_i <- as.numeric(tbl[tbl > 0]) / length(pred_all)
+    shannon_reps[rep_i] <- -sum(p_i * log(p_i))
   }
-  mean(richness_reps)
+  list(richness = mean(richness_reps),
+       shannon_h = mean(shannon_reps),
+       shannon_effective = mean(exp(shannon_reps)))
 }
 
 # ============================================================================
@@ -350,6 +388,40 @@ compute_spectral_species_richness <- function(r, veg_mask, n_clusters = 50,
 # count from there) -- on the order of tens of seconds to low minutes per
 # site-year for all three Rao's Q variants combined, well under the cost of
 # the spectral-species-richness step (RF + K-means, n_reps_ssr reps) above.
+# ----------------------------------------------------------------------------
+# 6a. PCA-based band reduction, ALL-BANDS Rao's Q ONLY.
+# ----------------------------------------------------------------------------
+# rao_q_window() below runs a pairwise-distance computation per window; fed
+# the full ~346-band raster directly, every 3x3 window's dist() call is over
+# ~346 dimensions. Reduce to the leading PCs that explain a fixed variance
+# threshold first, same convention already used for CHV/SSR (prcomp(),
+# center = TRUE, scale. = FALSE) -- N is data-driven per site-year (band
+# count varies slightly after bad-band masking), not a fixed count. NDVI and
+# NIRv Rao's Q are NOT reduced -- they're already 1-dimensional.
+#
+# PCA loadings are fit on complete-case (non-NA, i.e. in-veg-mask) pixels
+# only, then applied to every pixel via predict.prcomp()'s matrix multiply,
+# which propagates NA rows through untouched -- preserving the input
+# raster's spatial NA structure (out-of-mask cells stay NA in every output
+# PC layer) without a second masking pass.
+pca_reduce_raster <- function(r, veg_mask, var_threshold = 0.99) {
+  r_masked <- mask(r, veg_mask)
+  vals <- values(r_masked)   # ncell x nlyr, NA preserved outside the mask
+  complete_idx <- stats::complete.cases(vals)
+  if (sum(complete_idx) < 2) return(r_masked)
+
+  pca <- prcomp(vals[complete_idx, , drop = FALSE], center = TRUE, scale. = FALSE)
+  cum_var <- cumsum(pca$sdev^2) / sum(pca$sdev^2)
+  n_pc <- which(cum_var >= var_threshold)[1]
+  if (is.na(n_pc)) n_pc <- length(pca$sdev)
+
+  scores_all <- predict(pca, newdata = vals)[, seq_len(n_pc), drop = FALSE]
+  pc_r <- rast(r_masked, nlyr = n_pc)
+  values(pc_r) <- scores_all
+  names(pc_r) <- paste0("PC", seq_len(n_pc))
+  pc_r
+}
+
 rao_q_window <- function(window_vals) {
   window_vals <- window_vals[stats::complete.cases(window_vals), , drop = FALSE]
   n <- nrow(window_vals)
@@ -475,7 +547,7 @@ if (length(site_year_jobs) == 0) {
 results <- tibble(
   tower_id = character(), neon_site = character(), year = character(),
   cv = double(), chv = double(), chv_standardized = double(),
-  spectral_species_richness = double(),
+  spectral_species_richness = double(), shannon_h = double(), shannon_effective = double(),
   raoq_ndvi = double(), raoq_nirv = double(), raoq_allbands = double(),
   status = character()
 )
@@ -497,7 +569,8 @@ for (j in seq_along(site_year_jobs)) {
     data <- get_tower_reflectance(tower_id, job$files, buffer_m)
     if (is.null(data)) {
       tibble(tower_id = tower_id, neon_site = neon_site, year = yr,
-             cv = NA_real_, chv = NA_real_, spectral_species_richness = NA_real_,
+             cv = NA_real_, chv = NA_real_,
+             spectral_species_richness = NA_real_, shannon_h = NA_real_, shannon_effective = NA_real_,
              raoq_ndvi = NA_real_, raoq_nirv = NA_real_, raoq_allbands = NA_real_,
              status = "no reflectance data")
     } else {
@@ -509,28 +582,36 @@ for (j in seq_along(site_year_jobs)) {
 
       cat("  computing CV...\n");  cv_val  <- compute_cv(r, veg_mask)
       cat("  computing CHV...\n"); chv_val <- compute_chv(r, veg_mask, n_pc_chv)
-      cat("  computing spectral species richness (", n_reps_ssr, " reps)...\n", sep = "")
-      ssr_val <- compute_spectral_species_richness(r, veg_mask, n_clusters,
+      cat("  computing spectral species richness + Shannon's H' (", n_reps_ssr, " reps)...\n", sep = "")
+      ssr_result <- compute_spectral_species_richness(r, veg_mask, n_clusters,
                                                     n_subsample_pixels, n_pc_ssr, n_reps_ssr)
+      ssr_val         <- ssr_result$richness
+      shannon_h_val   <- ssr_result$shannon_h
+      shannon_eff_val <- ssr_result$shannon_effective
 
       cat("  computing Rao Q (NDVI), local moving-window...\n")
       raoq_ndvi <- compute_rao_q_raster_local(mask(ndvi, veg_mask), raoq_window)
       cat("  computing Rao Q (NIRv), local moving-window...\n")
       raoq_nirv <- compute_rao_q_raster_local(mask(nirv, veg_mask), raoq_window)
-      cat("  computing Rao Q (all bands), local moving-window...\n")
-      raoq_all  <- compute_rao_q_raster_local(mask(r, veg_mask), raoq_window)
+      cat("  computing Rao Q (all bands), local moving-window (PCA-reduced)...\n")
+      r_allbands_pca <- pca_reduce_raster(r, veg_mask, raoq_pca_var_threshold)
+      cat("    reduced to", nlyr(r_allbands_pca), "PC(s) (>=",
+          raoq_pca_var_threshold * 100, "% variance)\n", sep = "")
+      raoq_all  <- compute_rao_q_raster_local(r_allbands_pca, raoq_window)
 
       status <- if (tower_id %in% single_year_tower_ids) "success (single-year site)" else "success"
 
       tibble(tower_id = tower_id, neon_site = neon_site, year = yr,
-             cv = cv_val, chv = chv_val, spectral_species_richness = ssr_val,
+             cv = cv_val, chv = chv_val,
+             spectral_species_richness = ssr_val, shannon_h = shannon_h_val, shannon_effective = shannon_eff_val,
              raoq_ndvi = raoq_ndvi, raoq_nirv = raoq_nirv, raoq_allbands = raoq_all,
              status = status)
     }
   }, error = function(e) {
     cat("  unexpected error:", conditionMessage(e), "\n")
     tibble(tower_id = tower_id, neon_site = neon_site, year = yr,
-           cv = NA_real_, chv = NA_real_, spectral_species_richness = NA_real_,
+           cv = NA_real_, chv = NA_real_,
+           spectral_species_richness = NA_real_, shannon_h = NA_real_, shannon_effective = NA_real_,
            raoq_ndvi = NA_real_, raoq_nirv = NA_real_, raoq_allbands = NA_real_,
            status = paste("error:", conditionMessage(e)))
   })
@@ -545,7 +626,8 @@ for (j in seq_along(site_year_jobs)) {
   results <- results %>%
     mutate(chv_standardized = (chv - mean(chv, na.rm = TRUE)) / sd(chv, na.rm = TRUE)) %>%
     select(tower_id, neon_site, year, cv, chv, chv_standardized,
-           spectral_species_richness, raoq_ndvi, raoq_nirv, raoq_allbands, status)
+           spectral_species_richness, shannon_h, shannon_effective,
+           raoq_ndvi, raoq_nirv, raoq_allbands, status)
 
   # save incrementally so a crash/interruption partway through doesn't lose
   # completed site-years (matches AnnualFootprintExtent.R)
