@@ -5,5 +5,11 @@
 .Renviron
 Data/
 sub
+
+# large NEON binary/archive formats -- covers ones landing outside Data/
+# (e.g. manually uploaded/test tiles at repo root), not just the gitignored
+# data directories themselves
+*.h5
+*.zip
 ~$LogicAndAnnotations.pptx
 LogicAndAnnotations.pptx
