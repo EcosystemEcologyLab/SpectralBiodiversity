@@ -79,8 +79,8 @@ library(tibble)
 # ============================================================================
 # 0. Setup
 # ============================================================================
-hyperspec_dir <- "X:/moore/SpectralBiodiversity/Data/NEON_Hyperspec"
-out_csv       <- "X:/moore/SpectralBiodiversity/Data/spectral_diversity_by_year.csv"
+hyperspec_dir <- "D:/projects/moore/SpectralBiodiversity/Data/NEON_Hyperspec"
+out_csv       <- "D:/projects/moore/SpectralBiodiversity/Data/spectral_diversity_by_year.csv"
 
 buffer_m           <- 500   # single buffer for ALL metrics (CV, CHV, SSR, RaoQ x3)
 ndvi_thresh         <- 0.4
