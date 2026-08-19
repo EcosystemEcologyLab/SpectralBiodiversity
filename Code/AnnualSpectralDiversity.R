@@ -16,8 +16,52 @@
 # see note below):
 #   1. Coefficient of Variation (CV)
 #   2. Convex Hull Volume (CHV), first 3 PCs
-#   3. Spectral Species Richness (RF + K-means, 50 clusters)
-#   4. Rao's Q (NDVI, NIRv, all-bands), classic (non-normalized) form, via a
+#   3. Spectral Species Richness -- RF proximity + K-means (50 clusters) to
+#      define cluster centroids on a subsample, then NEAREST-CENTROID
+#      assignment (not a second trained classifier) of every pixel to its
+#      closest centroid in PC space (Feret & Asner 2014, Ecological
+#      Applications 24:1289-1296). Previously used a second randomForest
+#      trained on the subsample's cluster labels and predict()'d on every
+#      pixel; that was replaced because a trained multi-class classifier's
+#      decision regions tile the ENTIRE PC space, so evaluating it on tens
+#      of thousands of pixels almost always hit all n_clusters labels
+#      somewhere regardless of real spectral diversity -- richness was
+#      saturating at n_clusters=50 essentially always. Nearest-centroid
+#      assignment has no such bias: richness can legitimately come out below
+#      n_clusters when pixels cluster near only a few centroids. See
+#      Section 5 for the vectorized (non-per-pixel-loop) implementation.
+#      OPEN CAVEAT, confirmed by synthetic validation, not resolved by this
+#      change: kmeans(centers = n_clusters) always returns exactly
+#      n_clusters non-empty partitions -- it subdivides however many real
+#      groups exist rather than collapsing unused centroids, and a large
+#      same-distribution evaluation population (a real reflectance raster)
+#      generically populates nearly all of them. Synthetic tests at
+#      n_clusters=50 (this script's configured value) saturated near 50
+#      whether the underlying population was 5 well-separated Gaussian
+#      blobs, a single tight homogeneous cluster, or blobs 50x tighter --
+#      the result was insensitive to real structure and separation, and only
+#      changed when n_clusters itself was lowered (n_clusters=10 -> richness
+#      ~10 on the same 5-blob data). So nearest-centroid removes the
+#      classifier-extrapolation bias described above and a second,
+#      independently-found bug (see Section 5's assign_nearest_centroid
+#      comment: km$centers live in a different coordinate space than the PC
+#      scores being classified), but it does NOT, by itself, guarantee
+#      richness comes out below n_clusters on real, continuously-varying
+#      hyperspectral data. Deliberately left open rather than silently
+#      patched (e.g. with an ad hoc minimum-occupancy threshold) -- a real
+#      fix likely means tuning n_clusters/n_subsample_pixels or reconsidering
+#      the clustering approach, decisions the config comment near
+#      n_clusters flags for a human, not this change.
+#   4. Convex Hull Area (CHA), band-selection-based (Gholizadeh et al. 2018,
+#      Remote Sensing of Environment 206:240-253) -- found to outperform CV,
+#      CHV, and SID specifically at ~1m airborne resolution (this script's
+#      resolution regime; CV degraded badly at this scale in that paper).
+#      Distinct from CHV: CHV takes pixels as points in PC space and hulls
+#      the pixel cloud; CHA takes BANDS as points in a 2D (mean-spectrum,
+#      pixel-spectrum) space for one pixel at a time, and is averaged across
+#      all vegetation pixels in the plot. No PCA, clustering, or RF -- see
+#      Section 4a.
+#   5. Rao's Q (NDVI, NIRv, all-bands), classic (non-normalized) form, via a
 #      local per-window implementation (Section 6) -- NOT via
 #      pyGNDiv/reticulate, and NOT via rasterdiv::paRao() (tried first; see
 #      Section 6 for why it doesn't work at this resolution). Comparability
@@ -35,14 +79,21 @@
 #      Rao's Q numbers (e.g. earlier ABBY test runs, or the rasterdiv-era
 #      output) are NOT numerically comparable to this version's
 #      raoq_allbands.
-#   5. Spectral Shannon's index (H') and its Hill-number effective diversity
+#   6. Spectral Shannon's index (H') and its Hill-number effective diversity
 #      (exp(H'), Wang et al. 2018, Remote Sensing of Environment 211:218-228,
 #      Table 2), computed from the same spectral-species cluster assignments
 #      spectral species richness already produces (Section 5) -- no separate
 #      classification step.
 #
+# NOTE on PCA usage (open decision, not acted on): CHV, SSR, and the
+# all-bands Rao's Q still reduce dimensionality via PCA, unchanged by this
+# session's edits. Whether to replace PCA with a fixed manual band set
+# instead is an open decision, deliberately deferred so the nearest-centroid
+# SSR fix and the new CHA metric (which uses no PCA at all) can be tested in
+# isolation first.
+#
 # Differences from ComputeSpecBiodiv.R:
-#   - a single fixed 500m buffer is used for ALL FOUR metrics. The original
+#   - a single fixed 500m buffer is used for ALL METRICS. The original
 #     script's two different buffers (530m for CV/CHV/SSR, 300m for Rao Q)
 #     were tied to footprint-related design choices that don't apply to this
 #     question -- every metric for every site-year uses the same 500m buffer
@@ -68,7 +119,15 @@
 # Runtime: dominated by spectral species richness (RF + K-means, n_reps_ssr
 # reps per site-year) and the three local Rao's Q moving-window passes (one
 # per variant, no per-window Python round-trip and no raster-wide distance
-# matrix). The 500m
+# matrix). Spectral species richness's per-rep cost dropped when the second
+# RF classifier + predict() step was replaced with nearest-centroid
+# assignment (see Section 5) -- ~1.24x per-rep speedup on synthetic
+# benchmark data (10000 pixels, 1500 subsample, 50 clusters, 4 PCs: 8.7s ->
+# 7.1s per rep), i.e. roughly 0.6 min saved per site-year at n_reps_ssr=20;
+# modest rather than dramatic, since the kept first RF (for proximity) and
+# kmeans are still most of the per-rep cost. CHA (Section 4a) adds a fast
+# per-pixel geometric pass with no PCA/clustering/RF, negligible next to SSR
+# and Rao's Q. The 500m
 # buffer here is smaller than ComputeSpecBiodiv.R's CV/CHV/SSR buffer (530m,
 # so that part of the cost is about the same) but larger than its Rao Q
 # buffer (300m) -- area scales as radius^2, so each Rao Q variant here covers
@@ -97,7 +156,13 @@ out_csv       <- "D:/projects/moore/SpectralBiodiversity/Data/spectral_diversity
 
 buffer_m           <- 500   # single buffer for ALL metrics (CV, CHV, SSR, RaoQ x3)
 ndvi_thresh         <- 0.4
-n_clusters           <- 50
+n_clusters           <- 50  # spectral species richness ceiling -- see Section 5's
+                             # OPEN CAVEAT: nearest-centroid richness saturates near
+                             # this value for real, continuously-varying data;
+                             # confirmed insensitive to real cluster separation in
+                             # synthetic tests. Lowering this is the actual lever if
+                             # richness needs to be less saturated -- not yet done,
+                             # left as a deliberate open decision.
 n_subsample_pixels   <- 2500
 n_pc_ssr             <- 4
 n_pc_chv             <- 3
@@ -269,6 +334,45 @@ compute_chv <- function(r, veg_mask, n_pc = 3) {
 }
 
 # ============================================================================
+# 4a. Metric: Convex Hull Area (CHA), band-selection-based (Gholizadeh et al.
+#     2018, Remote Sensing of Environment 206:240-253) -- found to outperform
+#     CV, CHV, and SID specifically at ~1m airborne resolution (this script's
+#     resolution regime; CV degraded badly at this scale in that paper).
+# ============================================================================
+# Distinct from CHV above: CHV treats PIXELS as points in PC space and hulls
+# the pixel cloud (one hull per plot). CHA treats BANDS as points in a 2D
+# space -- for ONE pixel, each band contributes one point (plot mean
+# reflectance at that band, this pixel's reflectance at that band) -- and is
+# averaged across all vegetation pixels in the plot. No PCA, clustering, or
+# RF -- a fast per-pixel geometric calculation using the same
+# geometry::convhulln(..., output.options = "FA") approach as CHV; for a 2D
+# point set $vol is the qhull "volume" field, which for 2 dimensions is the
+# polygon's area (not $area, which is the perimeter -- confirmed against a
+# hand-computed triangle area during validation).
+#
+# A pixel whose spectrum equals the plot mean spectrum exactly produces a
+# perfectly collinear point set (every point falls on the y = x line), which
+# qhull cannot build a hull from -- it errors ("Initial simplex is flat")
+# rather than returning 0. That collinear-input error is mapped to area 0
+# here (not NA): a degenerate, zero-width point set has zero enclosed area by
+# definition, and this is an expected, not exceptional, case (a pixel
+# identical to the plot mean).
+compute_cha <- function(r, veg_mask) {
+  r_masked <- mask(r, veg_mask)
+  vals <- values(r_masked, na.rm = TRUE)   # n_pixels x n_bands
+  if (nrow(vals) == 0) return(NA_real_)
+  mean_spectrum <- colMeans(vals, na.rm = TRUE)
+
+  cha_vals <- apply(vals, 1, function(px) {
+    pts <- cbind(mean_spectrum, px)
+    ch <- tryCatch(convhulln(pts, output.options = "FA"), error = function(e) NULL)
+    if (is.null(ch)) return(0)
+    ch$vol
+  })
+  mean(cha_vals, na.rm = TRUE)
+}
+
+# ============================================================================
 # 5. Metric 3: Spectral Species Richness (reused from ComputeSpecBiodiv.R),
 #    plus spectral Shannon's index H' and its Hill-number effective
 #    diversity exp(H'), reusing the SAME per-rep classifier output --
@@ -280,6 +384,23 @@ compute_chv <- function(r, veg_mask, n_pc = 3) {
 # list's first element only in some contexts and error in others, rather
 # than doing the wrong thing quietly, but don't rely on that; unpack
 # explicitly.
+#
+# assign_nearest_centroid(): vectorized nearest-centroid assignment (Feret &
+# Asner 2014, Ecological Applications 24:1289-1296, the paper that
+# originated the "spectral species" method). Every row of `x` (n x d) is
+# assigned to whichever row of `centers` (k x d) is closest by Euclidean
+# distance. Uses the ||x-c||^2 = ||x||^2 - 2 x.c + ||c||^2 expansion so the
+# full n x k squared-distance matrix comes from one matrix multiply, not a
+# per-pixel loop -- flexclust::dist2() would do the same thing but isn't
+# installed and isn't worth adding as a new dependency for this.
+assign_nearest_centroid <- function(x, centers) {
+  x <- as.matrix(x); centers <- as.matrix(centers)
+  x_sq <- rowSums(x^2)
+  c_sq <- rowSums(centers^2)
+  d2 <- outer(x_sq, c_sq, "+") - 2 * (x %*% t(centers))
+  max.col(-d2, ties.method = "first")
+}
+
 compute_spectral_species_richness <- function(r, veg_mask, n_clusters = 50,
                                               n_subsample = 2500, n_pc = 4,
                                               n_reps = 20) {
@@ -303,19 +424,44 @@ compute_spectral_species_richness <- function(r, veg_mask, n_clusters = 50,
     prox_dist <- as.dist(1 - rf$proximity)
     km <- kmeans(cmdscale(prox_dist, k = n_pc), centers = n_clusters, nstart = 10)
 
-    classifier <- randomForest(x = pcs_sub, y = as.factor(km$cluster), ntree = 500)
-    pred_all <- predict(classifier, newdata = pcs_all)
+    # Nearest-centroid assignment (Feret & Asner 2014) in place of a second
+    # trained classifier -- see the header comment above and the file header
+    # for why: a trained multi-class RF's decision regions tile the entire
+    # PC space and almost always hit every n_clusters label somewhere, which
+    # was saturating richness at n_clusters regardless of real spectral
+    # diversity. Nearest-centroid has no such bias -- richness legitimately
+    # comes out below n_clusters when pixels cluster near only a few
+    # centroids.
+    #
+    # Centroids for this step must be km's 50 CLUSTER LABELS re-expressed in
+    # PC space, NOT km$centers directly -- km$centers are centroids of the
+    # cmdscale(prox_dist) embedding (RF-proximity-based MDS coordinates), a
+    # different coordinate system from pcs_all, not merely a rescaling of it
+    # (confirmed empirically during validation: for a pcs_sub range of
+    # roughly +-75, the corresponding cmdscale/km$centers range was roughly
+    # +-0.07). Computing Euclidean nearest-centroid between pcs_all and
+    # km$centers would compare two unrelated spaces and, confirmed by the
+    # synthetic regression tests below, does not reproduce the intended
+    # fix (a homogeneous synthetic population still saturated near
+    # n_clusters=50). Re-deriving each cluster's PC-space centroid as the
+    # mean, in pcs_sub's own coordinates, of the subsample points that km
+    # assigned to it keeps the RF-proximity + MDS + kmeans clustering step
+    # exactly as specified while making the subsequent nearest-centroid
+    # assignment geometrically meaningful.
+    pc_centroids <- rowsum(pcs_sub, group = km$cluster) / as.numeric(table(km$cluster))
+    cluster_all <- assign_nearest_centroid(pcs_all, pc_centroids)
 
-    richness_reps[rep_i] <- length(unique(pred_all))
+    richness_reps[rep_i] <- length(unique(cluster_all))
 
     # Spectral Shannon's index (Wang et al. 2018, RSE 211:218-228, Table 2):
     # H' = -sum(p_i * ln(p_i)) over the proportion of pixels assigned to
-    # each spectral-species cluster. table() on a factor reports zero-count
-    # levels explicitly (classifier factor levels the subsample never
-    # predicted) -- drop those before the sum, since 0*ln(0) is NaN in R,
-    # not the mathematical convention's 0.
-    tbl <- table(pred_all)
-    p_i <- as.numeric(tbl[tbl > 0]) / length(pred_all)
+    # each spectral-species cluster. Only clusters actually assigned appear
+    # in table() here (unlike the old factor-level classifier output), so
+    # there are no zero-count levels to drop -- but the tbl[tbl > 0] guard is
+    # kept regardless, since 0*ln(0) is NaN in R, not the mathematical
+    # convention's 0.
+    tbl <- table(cluster_all)
+    p_i <- as.numeric(tbl[tbl > 0]) / length(cluster_all)
     shannon_reps[rep_i] <- -sum(p_i * log(p_i))
   }
   list(richness = mean(richness_reps),
@@ -546,7 +692,7 @@ if (length(site_year_jobs) == 0) {
 # ============================================================================
 results <- tibble(
   tower_id = character(), neon_site = character(), year = character(),
-  cv = double(), chv = double(), chv_standardized = double(),
+  cv = double(), chv = double(), chv_standardized = double(), cha = double(),
   spectral_species_richness = double(), shannon_h = double(), shannon_effective = double(),
   raoq_ndvi = double(), raoq_nirv = double(), raoq_allbands = double(),
   status = character()
@@ -569,7 +715,7 @@ for (j in seq_along(site_year_jobs)) {
     data <- get_tower_reflectance(tower_id, job$files, buffer_m)
     if (is.null(data)) {
       tibble(tower_id = tower_id, neon_site = neon_site, year = yr,
-             cv = NA_real_, chv = NA_real_,
+             cv = NA_real_, chv = NA_real_, cha = NA_real_,
              spectral_species_richness = NA_real_, shannon_h = NA_real_, shannon_effective = NA_real_,
              raoq_ndvi = NA_real_, raoq_nirv = NA_real_, raoq_allbands = NA_real_,
              status = "no reflectance data")
@@ -585,6 +731,7 @@ for (j in seq_along(site_year_jobs)) {
 
       cat("  computing CV...\n");  cv_val  <- compute_cv(r, veg_mask)
       cat("  computing CHV...\n"); chv_val <- compute_chv(r, veg_mask, n_pc_chv)
+      cat("  computing CHA...\n"); cha_val <- compute_cha(r, veg_mask)
       cat("  computing spectral species richness + Shannon's H' (", n_reps_ssr, " reps)...\n", sep = "")
       ssr_result <- compute_spectral_species_richness(r, veg_mask, n_clusters,
                                                     n_subsample_pixels, n_pc_ssr, n_reps_ssr)
@@ -605,7 +752,7 @@ for (j in seq_along(site_year_jobs)) {
       status <- if (tower_id %in% single_year_tower_ids) "success (single-year site)" else "success"
 
       tibble(tower_id = tower_id, neon_site = neon_site, year = yr,
-             cv = cv_val, chv = chv_val,
+             cv = cv_val, chv = chv_val, cha = cha_val,
              spectral_species_richness = ssr_val, shannon_h = shannon_h_val, shannon_effective = shannon_eff_val,
              raoq_ndvi = raoq_ndvi, raoq_nirv = raoq_nirv, raoq_allbands = raoq_all,
              status = status)
@@ -613,7 +760,7 @@ for (j in seq_along(site_year_jobs)) {
   }, error = function(e) {
     cat("  unexpected error:", conditionMessage(e), "\n")
     tibble(tower_id = tower_id, neon_site = neon_site, year = yr,
-           cv = NA_real_, chv = NA_real_,
+           cv = NA_real_, chv = NA_real_, cha = NA_real_,
            spectral_species_richness = NA_real_, shannon_h = NA_real_, shannon_effective = NA_real_,
            raoq_ndvi = NA_real_, raoq_nirv = NA_real_, raoq_allbands = NA_real_,
            status = paste("error:", conditionMessage(e)))
@@ -628,7 +775,7 @@ for (j in seq_along(site_year_jobs)) {
   # the full site-year sample once the loop finishes.
   results <- results %>%
     mutate(chv_standardized = (chv - mean(chv, na.rm = TRUE)) / sd(chv, na.rm = TRUE)) %>%
-    select(tower_id, neon_site, year, cv, chv, chv_standardized,
+    select(tower_id, neon_site, year, cv, chv, chv_standardized, cha,
            spectral_species_richness, shannon_h, shannon_effective,
            raoq_ndvi, raoq_nirv, raoq_allbands, status)
 

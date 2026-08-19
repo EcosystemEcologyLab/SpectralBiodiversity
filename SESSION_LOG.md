@@ -4,6 +4,95 @@ Committed, dated record of work performed in this repository. Reverse
 chronological order, newest entry at the top. See CLAUDE.md for the
 convention this file follows.
 
+## 2026-08-19 UTC — AnnualSpectralDiversity.R: nearest-centroid SSR, new CHA metric, found and fixed a second SSR bug
+
+Three requested changes to `Code/AnnualSpectralDiversity.R` only (`ComputeSpecBiodiv.R`
+and the footprint scripts were explicitly out of scope and untouched, confirmed
+via `git status` at the end).
+
+**Change 1 -- Spectral Species Richness, RF-classifier saturation fix.**
+`compute_spectral_species_richness()`'s second stage (a `randomForest` trained
+on the k-means subsample labels, `predict()`'d on every pixel) was replaced
+with nearest-centroid assignment (Feret & Asner 2014, Ecological Applications
+24:1289-1296) via a new vectorized `assign_nearest_centroid()` helper (single
+`n x k` distance matrix via the `||x-c||^2` expansion, no per-pixel loop;
+`flexclust::dist2()` would do the same but isn't installed and wasn't added as
+a new dependency). The RF-proximity + `kmeans(cmdscale(...), centers =
+n_clusters)` clustering stage on the subsample is unchanged.
+
+While validating this against synthetic data (5 well-separated Gaussian blobs;
+a near-homogeneous single cluster) as directed, found a SECOND, independent bug
+not in the original task description: `km$centers` live in the `cmdscale()`
+embedding of RF proximity distances, not in PC space -- confirmed empirically
+(a `pcs_sub` range of roughly +-75 corresponded to a `km$centers` range of
+roughly +-0.07, not a rescaling, an unrelated coordinate system). Computing
+nearest-centroid distance between `pcs_all` and `km$centers` as originally
+instructed would compare two incompatible spaces. Flagged this to the user
+before proceeding (not silently reinterpreted); user chose the fix of
+re-deriving each of the 50 clusters' centroids as the mean, in `pcs_sub`'s own
+PC coordinates, of the subsample points `km$cluster` assigned to it
+(`rowsum(pcs_sub, group = km$cluster) / table(km$cluster)`), keeping the
+RF-proximity/MDS/kmeans structure exactly as specified.
+
+With that fix applied, a second, deeper issue surfaced empirically and was also
+flagged to the user before committing: `kmeans(centers = n_clusters)` always
+returns exactly `n_clusters` non-empty partitions -- it subdivides however many
+real groups exist rather than collapsing unused centroids -- and a large
+same-distribution evaluation population (any real reflectance raster) generically
+populates nearly all of them. Synthetic sweep at `n_clusters=50` (this script's
+configured value): 5 separated blobs -> richness ~49.7; homogeneous single
+cluster -> richness ~50; blobs 50x tighter -> richness ~49.3 -- saturation was
+insensitive to real structure/separation, and only responded to lowering
+`n_clusters` itself (n_clusters=10 on the same 5-blob data -> richness ~10,
+i.e. still saturated at the (lower) ceiling, not at the true group count). User
+directed: commit the nearest-centroid change as scoped (it is a real fix for
+the classifier-extrapolation bias described in the task, and for the
+coordinate-space bug found during validation) with this residual-saturation
+caveat clearly flagged in the script (Section 5 header comment, and a comment
+at the `n_clusters <- 50` config line) rather than silently patched (e.g. an
+ad hoc occupancy threshold) or silently left undocumented. Tuning
+`n_clusters`/`n_subsample_pixels` or reconsidering the clustering approach is
+the likely real lever and is left as an open decision for a future session.
+
+Runtime: nearest-centroid vs. the old second-RF-classifier step, benchmarked on
+synthetic data (10000 pixels, 1500 subsample, 50 clusters, 4 PCs): 8.7s ->
+7.1s per rep, ~1.24x speedup (~0.6 min saved per site-year at
+`n_reps_ssr=20`) -- modest rather than dramatic, since the kept first RF (for
+proximity) and kmeans remain most of the per-rep cost.
+
+**Change 2 -- new metric: Convex Hull Area (CHA).** Added `compute_cha(r,
+veg_mask)` near `compute_chv()` (Gholizadeh et al. 2018, Remote Sensing of
+Environment 206:240-253; reported to outperform CV, CHV, and SID specifically
+at ~1m airborne resolution, this script's regime). For each vegetation pixel,
+treats the plot mean spectrum and that pixel's spectrum as a 2D point set (one
+point per band) and takes the `geometry::convhulln(..., output.options =
+"FA")` hull's `$vol` field (confirmed via a hand-computed triangle case that
+`$vol`, not `$area`, is the polygon area for a 2D hull), averaged across all
+vegetation pixels in the plot. No PCA, clustering, or RF. Added as a new `cha`
+column in the results tibble/CSV schema and both the success and error/no-data
+branches of the Section 8 main loop.
+
+A pixel whose spectrum exactly equals the plot mean is perfectly collinear in
+this 2D construction, which `qhull` cannot build a hull from (errors "Initial
+simplex is flat" rather than returning 0) -- confirmed this empirically and
+mapped that specific error to area 0 in `compute_cha()`, since a degenerate
+zero-width point set has zero area by definition and this is an expected input
+(a pixel identical to the mean), not an exceptional one. Validated: a synthetic
+raster where every pixel equals the mean spectrum returns CHA = 0 exactly; a
+raster with real per-pixel variation (mean spectrum + Gaussian noise) returns a
+clearly positive CHA (~0.11 in the test raster).
+
+**Change 3 -- PCA usage left as-is, flagged as open.** CHV, SSR, and the
+all-bands Rao's Q still PCA-reduce, unchanged by this session -- per explicit
+instruction, not acted on. Noted in the file header as a deliberately deferred
+decision (replacing PCA with a fixed manual band set), to be tested once the
+above two changes have been evaluated in isolation.
+
+All validation was synthetic (no real `Data/` access in this sandbox, per this
+project's established pattern). Script re-parses cleanly
+(`parse("Code/AnnualSpectralDiversity.R")`, 54 top-level expressions, no
+errors). Not run against real hyperspectral data.
+
 ## 2026-08-18 23:11 UTC — Add FieldDiversity.R (field floristic diversity, plot-scope x flight-timing comparison)
 
 New script, `Code/DataAnalysis/FieldDiversity.R`. Computes Hill-Shannon
