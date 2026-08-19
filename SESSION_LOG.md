@@ -45,14 +45,26 @@ cluster -> richness ~50; blobs 50x tighter -> richness ~49.3 -- saturation was
 insensitive to real structure/separation, and only responded to lowering
 `n_clusters` itself (n_clusters=10 on the same 5-blob data -> richness ~10,
 i.e. still saturated at the (lower) ceiling, not at the true group count). User
-directed: commit the nearest-centroid change as scoped (it is a real fix for
-the classifier-extrapolation bias described in the task, and for the
-coordinate-space bug found during validation) with this residual-saturation
-caveat clearly flagged in the script (Section 5 header comment, and a comment
-at the `n_clusters <- 50` config line) rather than silently patched (e.g. an
-ad hoc occupancy threshold) or silently left undocumented. Tuning
-`n_clusters`/`n_subsample_pixels` or reconsidering the clustering approach is
-the likely real lever and is left as an open decision for a future session.
+directed: commit the nearest-centroid change as scoped, and do not gate it on
+solving the saturation problem -- the two bugs it fixes (classifier
+extrapolation, and the coordinate-space bug found during validation) are real,
+confirmed, and independent of whether saturation is fully solved: they're
+about HOW pixels get assigned to clusters, not about how many clusters exist
+to assign to. That fix stands on its own.
+
+The residual saturation problem is flagged plainly in the script (Section 5
+header comment, and a comment at the `n_clusters <- 50` config line) as an
+open problem for a future session, not something quietly papered over with an
+undecided threshold added in passing. Two candidates to weigh on their own,
+with real ABBY/SRER data in hand rather than guessed at from synthetic tests
+(neither implemented this session):
+- lowering `n_clusters` itself -- a methodological choice about what "spectral
+  species" should mean for this landscape, not a bug fix;
+- a principled minimum-occupancy criterion (a cluster only counts toward
+  richness above some pixel-share threshold) -- deferred specifically because
+  what threshold is principled vs. arbitrary can't be decided from synthetic
+  data alone, and an undocumented judgment call here is exactly the kind of
+  false-confidence risk this project has hit before.
 
 Runtime: nearest-centroid vs. the old second-RF-classifier step, benchmarked on
 synthetic data (10000 pixels, 1500 subsample, 50 clusters, 4 PCs): 8.7s ->

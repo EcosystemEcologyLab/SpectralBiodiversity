@@ -30,10 +30,19 @@
 #      assignment has no such bias: richness can legitimately come out below
 #      n_clusters when pixels cluster near only a few centroids. See
 #      Section 5 for the vectorized (non-per-pixel-loop) implementation.
-#      OPEN CAVEAT, confirmed by synthetic validation, not resolved by this
-#      change: kmeans(centers = n_clusters) always returns exactly
-#      n_clusters non-empty partitions -- it subdivides however many real
-#      groups exist rather than collapsing unused centroids, and a large
+#      This change fixes two real, CONFIRMED bugs: the classifier-
+#      extrapolation bias described above, and a second, independently-found
+#      bug during validation (see Section 5's assign_nearest_centroid
+#      comment: km$centers lived in a different coordinate space than the PC
+#      scores being classified, not merely a rescaling of it). Both fixes
+#      stand on their own regardless of the open problem below -- they are
+#      about HOW pixels get assigned to clusters, not about how many
+#      clusters exist to assign to.
+#      OPEN PROBLEM, confirmed by synthetic validation, NOT resolved by this
+#      change and NOT the same problem as the two bugs above:
+#      kmeans(centers = n_clusters) always returns exactly n_clusters
+#      non-empty partitions -- it subdivides however many real groups exist
+#      rather than collapsing unused centroids -- and a large
 #      same-distribution evaluation population (a real reflectance raster)
 #      generically populates nearly all of them. Synthetic tests at
 #      n_clusters=50 (this script's configured value) saturated near 50
@@ -41,17 +50,20 @@
 #      blobs, a single tight homogeneous cluster, or blobs 50x tighter --
 #      the result was insensitive to real structure and separation, and only
 #      changed when n_clusters itself was lowered (n_clusters=10 -> richness
-#      ~10 on the same 5-blob data). So nearest-centroid removes the
-#      classifier-extrapolation bias described above and a second,
-#      independently-found bug (see Section 5's assign_nearest_centroid
-#      comment: km$centers live in a different coordinate space than the PC
-#      scores being classified), but it does NOT, by itself, guarantee
-#      richness comes out below n_clusters on real, continuously-varying
-#      hyperspectral data. Deliberately left open rather than silently
-#      patched (e.g. with an ad hoc minimum-occupancy threshold) -- a real
-#      fix likely means tuning n_clusters/n_subsample_pixels or reconsidering
-#      the clustering approach, decisions the config comment near
-#      n_clusters flags for a human, not this change.
+#      ~10 on the same 5-blob data, i.e. still saturated at the lower
+#      ceiling, not at the true group count). So richness will likely still
+#      trend toward n_clusters=50 on real data for this structural reason.
+#      Deliberately left open for a future session rather than quietly
+#      papered over with an ad hoc, undecided threshold added in passing --
+#      two candidates worth weighing on their own, with real ABBY/SRER data
+#      in hand, not guessed at from synthetic tests:
+#        (a) lowering n_clusters itself -- a methodological choice about what
+#            "spectral species" should mean for this landscape, not a bug fix;
+#        (b) a principled minimum-occupancy criterion (a cluster only counts
+#            toward richness above some pixel-share threshold) -- deferred
+#            because what threshold is principled vs. arbitrary can't be
+#            decided from synthetic data alone.
+#      See also the config comment at n_clusters <- 50.
 #   4. Convex Hull Area (CHA), band-selection-based (Gholizadeh et al. 2018,
 #      Remote Sensing of Environment 206:240-253) -- found to outperform CV,
 #      CHV, and SID specifically at ~1m airborne resolution (this script's
@@ -157,12 +169,14 @@ out_csv       <- "D:/projects/moore/SpectralBiodiversity/Data/spectral_diversity
 buffer_m           <- 500   # single buffer for ALL metrics (CV, CHV, SSR, RaoQ x3)
 ndvi_thresh         <- 0.4
 n_clusters           <- 50  # spectral species richness ceiling -- see Section 5's
-                             # OPEN CAVEAT: nearest-centroid richness saturates near
-                             # this value for real, continuously-varying data;
-                             # confirmed insensitive to real cluster separation in
-                             # synthetic tests. Lowering this is the actual lever if
-                             # richness needs to be less saturated -- not yet done,
-                             # left as a deliberate open decision.
+                             # OPEN PROBLEM: nearest-centroid richness still trends
+                             # toward this value on real, continuously-varying data
+                             # (confirmed insensitive to real cluster separation in
+                             # synthetic tests -- kmeans always fills all n_clusters
+                             # partitions). Two candidates for a future session, to
+                             # be weighed with real ABBY/SRER data, not decided here:
+                             # lowering n_clusters itself, or a principled minimum-
+                             # occupancy criterion. Neither implemented yet.
 n_subsample_pixels   <- 2500
 n_pc_ssr             <- 4
 n_pc_chv             <- 3
