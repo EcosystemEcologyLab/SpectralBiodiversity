@@ -3,7 +3,7 @@
 # compute_rao_q_raster_local() (not rasterdiv), PCA-reduced all-bands Rao's Q,
 # and the new list(richness, shannon_h, shannon_effective) SSR return value.
 
-job <- keep(site_year_jobs, ~ .x$tower_id == "US-xAB" & .x$year == "2017")[[1]]
+job <- keep(site_year_jobs, ~ .x$tower_id == "US-xSR" & .x$year == "2017")[[1]]
 cat("Testing", job$tower_id, job$year, "-", length(job$files), "files\n")
 
 t0 <- Sys.time()
@@ -40,6 +40,10 @@ chv_val <- compute_chv(r, veg_mask, n_pc_chv)
 cat("  CHV:", round(chv_val, 4), " (", round(difftime(Sys.time(), t1, units = "secs"), 1), "sec )\n")
 
 t1 <- Sys.time()
+cha_val <- compute_cha(r, veg_mask)
+cat("  CHA:", round(cha_val, 4), " (", round(difftime(Sys.time(), t1, units = "secs"), 1), "sec )\n")
+
+t1 <- Sys.time()
 ssr_result <- compute_spectral_species_richness(r, veg_mask, n_clusters,
                                                 n_subsample_pixels, n_pc_ssr, n_reps_ssr)
 cat("  SSR:", round(ssr_result$richness, 2),
@@ -70,7 +74,7 @@ cat("\n  TOTAL for this site-year:", round(difftime(Sys.time(), t0, units = "min
 
 test_result <- tibble(
   tower_id = job$tower_id, neon_site = neon_site, year = job$year,
-  cv = cv_val, chv = chv_val,
+  cv = cv_val, chv = chv_val, cha = cha_val,
   spectral_species_richness = ssr_result$richness,
   shannon_h = ssr_result$shannon_h, shannon_effective = ssr_result$shannon_effective,
   raoq_ndvi = raoq_ndvi, raoq_nirv = raoq_nirv, raoq_allbands = raoq_all,
