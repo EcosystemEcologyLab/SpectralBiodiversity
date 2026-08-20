@@ -150,6 +150,8 @@
 # completed site-year and a running average/ETA, so you can extrapolate for
 # your actual job count.
 
+Sys.setenv(PROJ_LIB = "C:/Program Files/R/R-4.4.1/library/terra/proj")
+
 library(terra)
 library(rhdf5)          # low-level NEON H5 reading
 library(geometry)        # convhulln for CHV
