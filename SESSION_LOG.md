@@ -4,6 +4,326 @@ Committed, dated record of work performed in this repository. Reverse
 chronological order, newest entry at the top. See CLAUDE.md for the
 convention this file follows.
 
+## 2026-08-20 UTC — Add ComputeLUE_Annual.R: annual-resolution LUE, a separate ratio-based method alongside (not replacing) ComputeLUE.R
+
+New script, `Code/DataAnalysis/ComputeLUE_Annual.R`. Computes LUE from
+ANNUAL-resolution (YY) AmeriFlux data as a SEPARATE, PARALLEL approach to the
+existing half-hourly regression-slope method in `ComputeLUE.R`.
+**`ComputeLUE.R` was read in full before writing anything and was NOT
+modified** -- confirmed via `git diff --stat` at the end showing no change --
+it stays exactly as-is in case the half-hourly approach is revisited later.
+Different output file (`lue_by_year_annual.csv` vs. `lue_by_year.csv`) so the
+two methodologically-distinct results can never overwrite or be confused.
+
+**Methodological distinction, unavoidable at this resolution, flagged
+prominently in the script header:** annual data gives exactly one GPP value
+and one PAR value per site-year, so there is no within-period variation left
+to fit `lm(GPP ~ APAR)`'s slope to -- the regression approach `ComputeLUE.R`
+uses is categorically unavailable here, not merely skipped. This script
+computes `LUE = GPP_annual / (PAR_annual * fPAR)` instead: a straightforward
+ratio, but one that does NOT have the ratio-of-means-bias protection the
+regression-slope approach was specifically built to provide (see
+`ComputeLUE.R`'s own header on this). Its `lue` values are therefore NOT
+expected to match a hypothetical regression-based annual estimate, and the
+two scripts' outputs must be treated as methodologically distinct, never
+interchangeable. A SECOND, separate caveat was also identified and
+documented (not something the task described in this much detail, but a
+direct consequence of the resolution change worth surfacing on its own): the
+half-hourly script restricts its flux data to the same calendar window the
+single-day NDVI/fPAR snapshot represents, keeping the two temporally
+consistent; annual GPP/PAR are whole-year aggregates by construction and
+can't be windowed that way, so this script's ratio blends dormant-season and
+peak-growing-season conditions together in a way the half-hourly version
+specifically avoids. `growing_season_source` is still resolved and reported
+here (for provenance and consistency with the other two LUE-family scripts),
+but no longer functions as an active data filter -- there's nothing left at
+annual resolution to filter.
+
+**File/column conventions -- CONFIRMED vs. still assumed, distinguished
+explicitly per the task's request.** `Code/NEON_FluxVariability.R` was read
+in full: it already reads `./Data/NEON_Ameriflux/AnnualData` (one YY CSV per
+site) successfully in this repo, and its own column selection
+(`GPP = GPP_NT_VUT_REF`, `NEE = NEE_VUT_REF`, `RECO = RECO_NT_VUT_REF`,
+`ET = LE_F_MDS`, `year = TIMESTAMP` with no date parsing, i.e. TIMESTAMP is
+the bare 4-digit year) is direct repo evidence -- not a guess -- that these
+columns exist unchanged from their half-hourly names at annual resolution.
+GPP_NT_VUT_REF's presence is therefore CONFIRMED, unlike everything in
+`ComputeLUE.R`'s HH-file section. A PAR-equivalent column is NOT confirmed
+by that evidence (`NEON_FluxVariability.R` never selects one) --
+`resolve_par_column()` tries `PPFD_IN` first (plausible given every other
+confirmed column kept its name, but unverified for this specific one) and
+falls back to `SW_IN_F`/`SW_IN` with a literature-default 2.02 umol/J
+shortwave-to-PPFD conversion factor (McCree/Britton & Dodd, not
+site-calibrated -- same caveat style as the existing NDVI_min/NDVI_max fPAR
+defaults) if PPFD_IN is absent. Which path was taken is recorded in a new
+`par_source` output column (`ppfd_in_annual` vs. `sw_in_derived`) -- an
+addition beyond the literally requested column list, justified by this
+project's established never-silently-blend-methods convention
+(`growing_season_source`, MODIS's `real_metadata`/`fallback_default`).
+
+**Units consistency -- explicitly checked, not assumed, per the task's
+specific warning about a yearly-sum-divided-by-a-mean bug.**
+`NEON_FluxVariability.R`'s own comment ("convert LE (W/m2) to ET (mm/yr) if
+you need absolute ET values... LE_F_MDS ... not mm") is repo evidence that
+YY variables remain flux-RATE MEANS (not summed totals), consistent with the
+standard FLUXNET2015 YY aggregation convention -- making
+`GPP_annual / (PAR_annual * fPAR)` unit-consistent with `ComputeLUE.R`'s own
+mol-CO2/mol-photon convention, evidence-informed but not verified against a
+real value. Added `check_gpp_plausible_range()` (default plausible annual-
+mean range: -5 to 30 umol CO2 m-2 s-1) as a concrete runtime guard against
+exactly the failure mode the task called out: a value in the magnitude of an
+annual SUM (e.g. ~200-3000 gC/m2/yr) landing where a mean flux rate is
+expected is flagged in `status` as a units-mismatch warning, not silently
+divided through as if it were correct.
+
+**Reuse, not reimplementation (per task instructions -- `ComputeLUE.R` read
+in full first).** `import_functions_from()` is necessarily redefined locally
+(it is the bootstrap mechanism itself -- it cannot import itself without
+circularity, same as every script independently stating its own `library()`
+calls). Everything it is USED to pull in is reused: the same
+`AnnualSpectralDiversity.R` set `ComputeLUE.R` imports (`read_neon_h5_tile`,
+`get_tower_reflectance`, `compute_ndvi_raster`, etc.) and
+`FieldDiversity.R`'s `get_flight_acquisition_date` -- AND, following the
+task's suggestion to check whether pieces of `ComputeLUE.R` itself are
+cleanly importable, `compute_mean_ndvi`, `compute_fpar`, and
+`resolve_growing_season` are imported DIRECTLY FROM `ComputeLUE.R` (confirmed
+these are standalone top-level functions there, not entangled with its
+half-hourly-specific state) rather than re-derived from
+`AnnualSpectralDiversity.R`/`FieldDiversity.R` a second time. Confirmed
+empirically that this import leaks none of `ComputeLUE.R`'s own pipeline
+state (`out_csv`, `results`, etc.) into the importing script's global
+environment -- same mechanism, same guarantee, as the prior sessions'
+imports from `AnnualSpectralDiversity.R`/`FieldDiversity.R`.
+
+Validated (synthetic only, same sandbox constraints as prior sessions):
+`resolve_par_column()`'s three-way branching (PPFD_IN preferred, SW_IN_F
+fallback, bare SW_IN fallback, NULL when neither exists);
+`check_gpp_plausible_range()` correctly passing a plausible annual-mean value
+and flagging a summed-total-magnitude value (1200) as implausible;
+`compute_annual_lue()` recovering a known true LUE EXACTLY (it's a
+deterministic ratio, not a fit -- 0.035 true across three different
+(gpp, par, fpar) triples, hand-computed) and guarding zero/NA APAR against
+Inf/NaN; an explicit units-error scenario confirming the ratio calculation
+*cannot* self-detect a GPP-is-actually-a-sum bug (it just returns a
+too-large-but-finite number) and that `check_gpp_plausible_range()` is what
+actually catches it -- exactly the validation-not-review check the task
+asked for; `load_annual_flux_data()` against a synthetic fixture matching
+the CONFIRMED real column set, checking -9999 handling for both GPP and
+PPFD_IN and correct tower_id extraction from filename for two different
+synthetic sites. 23/23 checks passed. The script `parse()`s cleanly (32
+top-level expressions) and, run directly, fails at the same expected point
+(missing `./Data/NEONsites.csv`) as `ComputeLUE.R`/`ExtractMODIS.R` did.
+
+**Not validated**: real annual AmeriFlux column names/values (whether
+`PPFD_IN` is actually present at annual resolution, whether GPP/PAR really
+are means rather than sums) -- needs a real run on the server, same
+established pattern as every other script in this project.
+
+## 2026-08-20 UTC — Add ExtractMODIS.R (AppEEARS MODIS FPAR/GPP) and extend ComputeLUE.R with a MODIS-derived LUE comparison
+
+Two pieces, both extending the LUE work from the earlier entry below (same
+day): `Code/DataAnalysis/ComputeLUE.R` already existed from that prior
+session, so it was read and extended rather than duplicated.
+
+**Part 1 -- `Code/DataAnalysis/ExtractMODIS.R` (new script).** Pulls
+MOD15A2H Fpar_500m and MOD17A2H Gpp_500m, 8-day composite, at all 45 tower
+Lat/Lon, via NASA's AppEEARS point-sample API, as a submit-one-combined-task
+-> poll -> download workflow (one task covering all 45 sites and all 4
+layers -- both products' data + QC bands -- not a per-site request loop).
+Date range is read from `spectral_diversity_by_year.csv`'s `year` column,
+never hardcoded. `appeears` (the R package) is not installed on this system
+and was not added; `httr2` (already installed) is used directly for the
+login/submit/poll/download HTTP calls instead, per "check what's already
+installed before assuming a package needs adding."
+
+**CRITICAL, explicit per the task's instructions**: this sandbox has no
+internet access, so every AppEEARS HTTP call in this script (login,
+task-submit, status-poll, bundle-list, file-download) -- and the exact
+response schema/field names/CSV column-naming convention each of those calls
+assumes -- was written from documented AppEEARS API/product conventions and
+has **never been executed, not even once**. This is explicitly NOT claimed
+as validated, consistent with this project's real-data-validation discipline
+(e.g. FieldDiversity.R's live H5-metadata investigation, AnnualSpectralDiversity.R's
+synthetic-only validation elsewhere in this log). What WAS validated in this
+sandbox, against synthetic data built to match AppEEARS' documented
+point-sample CSV format: the MOD15A2H FparLai_QC and MOD17A2H Psn_QC_500m
+bit-decoding logic (MODLAND_QC bit + FPAR's cloud-state bits), and the
+generic column-matching parser (`find_col()`/`find_col_exact()`/
+`parse_appeears_csv()`), which was deliberately written to match columns by
+substring rather than an exact hardcoded `<Product>_<Version>_<Layer>` string
+specifically because the real naming convention couldn't be confirmed. 24/24
+synthetic checks passed (QC-decoding truth table, scale-factor application,
+out-of-range-despite-good-QC exclusion, unmapped-tower-id handling, output
+schema). The user must run this on the server, watch it fail at whatever
+point the real API differs from what's assumed here, and fix that point
+specifically (the script's header points at `cat()`-ing the intermediate
+`resp_body_json()`/`bundle_files`/`names(raw_combined)` objects as the first
+debugging move) rather than assuming the whole thing needs rewriting if one
+step doesn't match.
+
+Credentials: `EARTHDATA_USERNAME`/`EARTHDATA_PASSWORD` env vars, read via
+`Sys.getenv()`, never hardcoded. Checked `.gitignore` before choosing this --
+`.Renviron` (R's standard mechanism for these) is already listed there
+alongside `.Rproj.user`/`.Rhistory`/`.RData`/`.Ruserdata`, so no new
+gitignore entry was needed.
+
+**Part 2 -- `ComputeLUE.R` extended, NDVI-derived pipeline untouched.** Added
+a second, MODIS-satellite-derived LUE estimate (`lue_modis`, `lue_modis_r2`)
+per site-year, computed on the EXACT SAME filtered half-hourly tower records
+(`filtered` -- same GPP_NT_VUT_REF, same PPFD_IN, same midday/growing-season/
+QC filtering) as the original NDVI-derived fit, with `APAR_modis = PPFD_IN *
+fpar_modis` in place of the NDVI-derived APAR -- an apples-to-apples
+comparison isolating the fPAR-source effect, per the task's explicit design.
+`fit_lue_regression()` is reused unchanged for both fits rather than
+duplicated. `fpar_modis` itself is the mean of QC-passed 8-day composites
+within the SAME growing-season window (`gs$months`/`target_year`, real
+flight month vs. fallback) already resolved for the NDVI-derived version --
+reused via a new `aggregate_modis_window()` helper, not a second window
+implementation. `gpp_modis_ref` (same aggregation, MODIS GPP) is reported
+alongside for comparison only and is never fed into either regression --
+tower `GPP_NT_VUT_REF` remains the sole GPP input to both fits. The original
+`fpar` output column is renamed `ndvi_fpar` so both fPAR sources are
+unambiguous in the header; new columns: `fpar_modis`, `lue_modis`,
+`lue_modis_r2`, `gpp_modis_ref`, `n_modis_composites_used`.
+
+Design choice, flagged rather than silently decided: `modis_fpar_raw.csv`/
+`modis_gpp_raw.csv` are treated as OPTIONAL inputs, not required ones --
+missing files (ExtractMODIS.R not yet run) print a clear one-time notice and
+degrade every MODIS-derived column to NA for the run, rather than `stop()`ing
+the whole pipeline. The NDVI-derived LUE calculation has no real dependency
+on MODIS data and shouldn't be blocked by a separate, network-dependent,
+not-yet-run script. A MODIS-side failure for one specific site-year is also
+caught on its own (separate `tryCatch`) and only NAs that site-year's MODIS
+columns -- it can never discard an already-successful NDVI-derived result.
+
+Validated (synthetic, same session): re-ran the original NDVI-derived
+validation harness unchanged first to confirm the extension didn't regress
+it (all checks still passing, `make_row()`'s schema assertion updated for
+the new columns), then added checks for `aggregate_modis_window()` (mean
+over QC-passed, in-window composites only; excludes QC-fail and
+out-of-growing-season-window rows; degrades to NA/0 for an unmatched
+tower_id or a `NULL` input) and `compute_modis_lue_addon()` (recovers a
+known true `lue_modis` slope -- 0.0280 true vs. 0.0278 fit -- from synthetic
+`GPP = intercept + slope*APAR_modis + noise` data fed through the SAME
+`filtered` object the NDVI-derived fit used; reports `gpp_modis_ref` and
+`n_modis_composites_used` correctly; degrades to all-NA, no error, when
+MODIS inputs are entirely missing). 41/41 checks passed. Both scripts also
+`parse()` cleanly and, run directly, fail at the identical expected point
+(`stop()` on missing `./Data/NEONsites.csv`) as the original ComputeLUE.R did.
+
+**Three-way comparison this now enables**, once ExtractMODIS.R has actually
+been run on the server: NDVI-derived fPAR (from the hyperspectral archive,
+`ndvi_fpar`) vs. MODIS-derived fPAR (`fpar_modis`) as two independent
+estimates of the same physical quantity feeding otherwise-identical LUE
+regressions (`lue` vs. `lue_modis`, directly comparable since GPP/PPFD/
+filtering are held fixed), plus MODIS's own independently-produced GPP
+product (`gpp_modis_ref`) as an out-of-band cross-check against tower-derived
+`GPP_NT_VUT_REF` -- three separate lines of evidence on the same site-years,
+none of them silently blended into the others.
+
+**Not validated**: the actual AppEEARS API interaction (Part 1's core
+purpose) and, downstream of that, MODIS-derived LUE on real data -- both
+require a real run on the server with internet access.
+
+## 2026-08-20 UTC — Add ComputeLUE.R: Light Use Efficiency from AmeriFlux HH data, regression-based
+
+New script, `Code/DataAnalysis/ComputeLUE.R`. Computes LUE (epsilon) per
+tower-year for the 45 NEON/AmeriFlux sites, as the SLOPE of
+`lm(GPP_NT_VUT_REF ~ APAR)` across filtered midday half-hourly AmeriFlux
+records, not a ratio of period means -- avoids ratio-of-means bias and gives
+an `lue_r2` per site-year as a free QA diagnostic (a poor fit flags a
+site-year where the light-response assumption may not hold, e.g. water
+stress). Fully standalone: no shared state with `AnnualSpectralDiversity.R`
+or the footprint pipeline, different output path.
+
+**Before-writing investigation** (per task instructions): no script in this
+repo reads AmeriFlux HH files today -- the only existing flux reader
+(`NEON_FluxVariability.R`) reads annual (`YY`) aggregates from
+`./Data/NEON_Ameriflux/AnnualData`, and gave no real HH filename to confirm
+against. This sandbox has no access to the real `D:`/`X:` data drives, so the
+real HH directory location and exact filename/version convention could NOT be
+confirmed. File discovery therefore uses a flexible match (site ID +
+"FLUXNET" + "_HH_" all present in the basename, not a rigid version-number
+regex) and `hh_data_dir` is a best-guess sibling of the confirmed
+`AnnualData` path, **flagged in the script header as unconfirmed -- must be
+verified/adjusted on the server**. QC-flag filtering (`NEE_VUT_REF_QC <= 1`)
+and the `YYYYMMDDHHMM` TIMESTAMP_START format are both standard
+AmeriFlux/FLUXNET2015 assumptions with no prior convention in this repo to
+confirm against; `read_hh_flux()` `stop()`s clearly if the expected columns
+are absent rather than silently proceeding on a wrong schema.
+
+**Growing-season month recovery.** `read_neon_h5_tile()` in
+`AnnualSpectralDiversity.R` carries no date field, but
+`Code/DataAnalysis/FieldDiversity.R`'s `get_flight_acquisition_date()`
+(previous session) already recovers the real flight date from the
+`ATCOR_Input_file` text log under `Metadata/Logs/<flightline>/`. Reused
+(imported, not reimplemented) here: when a real date resolves, its MONTH
+becomes the site-year's growing-season window (so the single NDVI/fPAR
+snapshot stays temporally consistent with the flux half-hours being
+regressed); otherwise a documented June-Sept fallback is used. Every row's
+`growing_season_source` column records which happened, never silently
+blended -- both paths are exercised in validation (see below).
+
+**Cross-script reuse mechanism.** The task asked to reuse (source/import, not
+copy-paste) `read_neon_h5_tile`, `get_tower_reflectance`, and
+`compute_ndvi_raster` from `AnnualSpectralDiversity.R`. Plain `source()` of
+that script isn't safe -- it's a monolithic script whose top level
+immediately runs the full site-year pipeline (H5 discovery, main loop, its
+own `write.csv`) as a side effect, not a function library, and no script in
+this repo currently imports from another for exactly that reason (prior
+cross-script reuse, e.g. `FieldDiversity.R`, reimplemented instead).
+Resolved by adding `import_functions_from(script_path, names)`, which
+`parse()`s the origin script and `eval()`s only the named top-level `<-`
+bindings (function defs and plain config constants alike, e.g.
+`bad_band_ranges`) into a dedicated environment -- confirmed empirically to
+import the needed bindings from both `AnnualSpectralDiversity.R` and
+`FieldDiversity.R` without leaking `towers_df`/`site_year_jobs` or any other
+pipeline state into the global environment, i.e. neither origin script's main
+loop runs. The actual logic stays single-sourced in the origin files; a later
+edit there is picked up automatically here.
+
+**Methodology choices flagged in the script, not silently decided:**
+regression includes an intercept (`lm(GPP ~ APAR)`, not forced through the
+origin) since forcing through zero is a stronger assumption than the
+light-response literature generally requires; fPAR uses literature-default
+`NDVI_min = 0.05` / `NDVI_max = 0.95` (Wang et al. 2016 uses ground-calibrated
+values instead -- not available for these sites, a known limitation worth
+revisiting); local solar time uses the equation of time (Cooper's
+approximation) plus a nominal-15-degree-meridian offset from each site's
+longitude, since AmeriFlux TIMESTAMP is local standard time and no per-site
+UTC-offset metadata exists in `NEONsites.csv` to do better than the nominal
+assumption.
+
+**Validation** (synthetic only -- no `Data/` access in this sandbox): a
+throwaway harness (not committed) imported every pure function/constant via
+the same `import_functions_from()` mechanism and checked, against synthetic
+fixtures: fPAR clipping and formula at both bounds and midpoint; local solar
+time is close to clock noon at a real site longitude (ABBY, -122.33) and
+monotonic across a day; `read_hh_flux()` converts -9999 to NA for both GPP
+and PPFD (including a QC-forced-pass fixture verifying the fill value doesn't
+survive a passing QC row), applies the QC<=1 filter correctly, and `stop()`s
+clearly on a missing required column; `find_hh_files()` matches version-suffix
+variants for the right site and excludes a different site's file;
+`resolve_growing_season()` exercised on all three paths -- real metadata
+resolves to the flight month tagged `real_metadata`, an unparseable date and
+an empty file list both fall back to the June-Sept default tagged
+`fallback_default`; `filter_midday_growing_season()` correctly enforces
+target year, target month(s), the local-solar-hour window, and the PPFD
+floor on a full synthetic year with a diurnal PPFD curve; and
+`fit_lue_regression()` recovers a known true slope (0.0350 true -> 0.0350
+fit) and intercept from synthetic `GPP = intercept + slope*APAR + noise`
+data with R^2 > 0.99, while a deliberately decoupled (pure-noise) GPP/APAR
+fixture correctly yields R^2 ~ 0 -- confirming the regression-based QA signal
+the method was chosen for actually works. All 30 checks passed. The full
+script also `parse()`s cleanly (40 top-level expressions) and, run directly,
+fails at the expected/correct point -- a clear `stop()`-style error on the
+missing `./Data/NEONsites.csv` -- rather than an obscure failure further in.
+
+**Not validated**: real AmeriFlux HH file structure/columns, real NEON H5
+collection-date recovery for LUE's specific site-years, and the
+`hh_data_dir` path all still need a real run on the server, per this
+project's established working pattern.
+
 ## 2026-08-19 UTC — AnnualSpectralDiversity.R: nearest-centroid SSR, new CHA metric, found and fixed a second SSR bug
 
 Three requested changes to `Code/AnnualSpectralDiversity.R` only (`ComputeSpecBiodiv.R`
