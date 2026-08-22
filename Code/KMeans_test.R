@@ -75,6 +75,7 @@ for (site in test_sites) {
     }
   }
 }
+library(tidyr)
 
 sweep_df <- bind_rows(sweep_results)
 cat("\n\n==== Full sweep results ====\n")
