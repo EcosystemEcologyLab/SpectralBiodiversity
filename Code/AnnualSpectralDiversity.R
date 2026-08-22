@@ -16,54 +16,34 @@
 # see note below):
 #   1. Coefficient of Variation (CV)
 #   2. Convex Hull Volume (CHV), first 3 PCs
-#   3. Spectral Species Richness -- RF proximity + K-means (50 clusters) to
-#      define cluster centroids on a subsample, then NEAREST-CENTROID
-#      assignment (not a second trained classifier) of every pixel to its
-#      closest centroid in PC space (Feret & Asner 2014, Ecological
-#      Applications 24:1289-1296). Previously used a second randomForest
-#      trained on the subsample's cluster labels and predict()'d on every
-#      pixel; that was replaced because a trained multi-class classifier's
-#      decision regions tile the ENTIRE PC space, so evaluating it on tens
-#      of thousands of pixels almost always hit all n_clusters labels
-#      somewhere regardless of real spectral diversity -- richness was
-#      saturating at n_clusters=50 essentially always. Nearest-centroid
-#      assignment has no such bias: richness can legitimately come out below
-#      n_clusters when pixels cluster near only a few centroids. See
-#      Section 5 for the vectorized (non-per-pixel-loop) implementation.
-#      This change fixes two real, CONFIRMED bugs: the classifier-
-#      extrapolation bias described above, and a second, independently-found
-#      bug during validation (see Section 5's assign_nearest_centroid
-#      comment: km$centers lived in a different coordinate space than the PC
-#      scores being classified, not merely a rescaling of it). Both fixes
-#      stand on their own regardless of the open problem below -- they are
-#      about HOW pixels get assigned to clusters, not about how many
-#      clusters exist to assign to.
-#      OPEN PROBLEM, confirmed by synthetic validation, NOT resolved by this
-#      change and NOT the same problem as the two bugs above:
-#      kmeans(centers = n_clusters) always returns exactly n_clusters
-#      non-empty partitions -- it subdivides however many real groups exist
-#      rather than collapsing unused centroids -- and a large
-#      same-distribution evaluation population (a real reflectance raster)
-#      generically populates nearly all of them. Synthetic tests at
-#      n_clusters=50 (this script's configured value) saturated near 50
-#      whether the underlying population was 5 well-separated Gaussian
-#      blobs, a single tight homogeneous cluster, or blobs 50x tighter --
-#      the result was insensitive to real structure and separation, and only
-#      changed when n_clusters itself was lowered (n_clusters=10 -> richness
-#      ~10 on the same 5-blob data, i.e. still saturated at the lower
-#      ceiling, not at the true group count). So richness will likely still
-#      trend toward n_clusters=50 on real data for this structural reason.
-#      Deliberately left open for a future session rather than quietly
-#      papered over with an ad hoc, undecided threshold added in passing --
-#      two candidates worth weighing on their own, with real ABBY/SRER data
-#      in hand, not guessed at from synthetic tests:
-#        (a) lowering n_clusters itself -- a methodological choice about what
-#            "spectral species" should mean for this landscape, not a bug fix;
-#        (b) a principled minimum-occupancy criterion (a cluster only counts
-#            toward richness above some pixel-share threshold) -- deferred
-#            because what threshold is principled vs. arbitrary can't be
-#            decided from synthetic data alone.
-#      See also the config comment at n_clusters <- 50.
+#   3. Spectral Species Richness -- self-adaptive fuzzy c-means (FCM), Wu et
+#      al. 2026 (Computers and Electronics in Agriculture 252:112108). The
+#      previous RF-proximity + K-means (50 clusters) + nearest-centroid
+#      approach (Feret & Asner 2014) was REMOVED entirely, not merely
+#      replaced in this loop: weekend diagnostics on real ABBY/SRER data
+#      (Code/KMeans_test.R, all k in {10..50} swept) found richness landing
+#      at EXACTLY k every time (100% of k) for every site-year, with no
+#      ABBY/SRER separation in Shannon's H' either -- confirming the
+#      saturation problem flagged as an open problem in a prior version of
+#      this file (see git history / SESSION_LOG.md for that post-mortem) was
+#      never resolved by the nearest-centroid fix, and that the RF+K-means
+#      approach carries no usable diversity signal on real data, at real
+#      expense (~1500-1700 sec/site-year at k=50). Adaptive-FCM SSR showed
+#      real, stable separation across 3 years in the same diagnostics
+#      (Code/DataAnalysis/FCM_test.R, CompareSSR_AdaptiveFCM_vs_KMeans.R,
+#      adaptive_fcm_ssr.py) at comparable-or-lower runtime, and is adopted
+#      here as the production method. See Section 5 for the implementation
+#      and its PROVISIONAL parameters (Section 0's c_max_ssr/fcm_fuzziness_w).
+#      A prior version of this section's SSR used a c=1 "floor-check" branch
+#      to try to catch an apparent c=2 floor artifact seen on real SRER
+#      data (every rep's L(c) maximized at c=2 with no interior peak, unlike
+#      ABBY's genuine interior peak at c~6-8); that branch was found dead by
+#      its own self-test (fuzzy within-cluster dispersion decreases
+#      monotonically in c even for pure noise, so c=1 essentially never won)
+#      and has been REMOVED, replaced by a conditional gap-statistic check
+#      (Tibshirani, Walther & Hastie 2001) that only runs for a rep whose
+#      primary search lands exactly at the c=2 floor -- see Section 5 for
+#      the full rule and its own provisional-parameter caveats.
 #   4. Convex Hull Area (CHA), band-selection-based (Gholizadeh et al. 2018,
 #      Remote Sensing of Environment 206:240-253) -- found to outperform CV,
 #      CHV, and SID specifically at ~1m airborne resolution (this script's
@@ -126,20 +106,25 @@
 # reused verbatim from ComputeSpecBiodiv.R -- this script only restructures
 # the loop and buffer logic around them -- EXCEPT Rao's Q (Section 6), which
 # uses a local per-window R implementation instead of ComputeSpecBiodiv.R's
-# pyGNDiv approach; see the note above and in Section 6 for why.
+# pyGNDiv approach, and EXCEPT Spectral Species Richness (Section 5), which
+# uses adaptive-FCM (reticulate + adaptive_fcm_ssr.py) instead of
+# ComputeSpecBiodiv.R's still-unchanged RF+K-means approach; see the notes
+# above and in Sections 5/6 for why.
 #
-# Runtime: dominated by spectral species richness (RF + K-means, n_reps_ssr
-# reps per site-year) and the three local Rao's Q moving-window passes (one
-# per variant, no per-window Python round-trip and no raster-wide distance
-# matrix). Spectral species richness's per-rep cost dropped when the second
-# RF classifier + predict() step was replaced with nearest-centroid
-# assignment (see Section 5) -- ~1.24x per-rep speedup on synthetic
-# benchmark data (10000 pixels, 1500 subsample, 50 clusters, 4 PCs: 8.7s ->
-# 7.1s per rep), i.e. roughly 0.6 min saved per site-year at n_reps_ssr=20;
-# modest rather than dramatic, since the kept first RF (for proximity) and
-# kmeans are still most of the per-rep cost. CHA (Section 4a) adds a fast
-# per-pixel geometric pass with no PCA/clustering/RF, negligible next to SSR
-# and Rao's Q. The 500m
+# Runtime: dominated by spectral species richness (adaptive-FCM, n_reps_ssr
+# reps per site-year, ~19 candidate-c fits per rep for the primary search's
+# c in [2, c_max_ssr], PLUS a conditional gap-statistic fallback -- up to
+# gap_check_c_max*(1 + gap_check_n_null) additional fits -- on whichever
+# reps land at the c=2 floor; see Section 5's header for the trigger rule)
+# and the three local Rao's Q moving-window passes (one per variant, no
+# per-window Python round-trip and no raster-wide distance matrix).
+# Diagnostics found adaptive-FCM SSR runtime comparable to or cheaper than
+# the single-k-means-fit approach it replaced when the gap fallback isn't
+# triggered; see Section 5's header for the diagnostic history and the
+# per-site-year gap-fallback timing note the main loop now prints. CHA
+# (Section 4a) adds a
+# fast per-pixel geometric pass with no PCA/clustering/RF, negligible next to
+# SSR and Rao's Q. The 500m
 # buffer here is smaller than ComputeSpecBiodiv.R's CV/CHV/SSR buffer (530m,
 # so that part of the cost is about the same) but larger than its Rao Q
 # buffer (300m) -- area scales as radius^2, so each Rao Q variant here covers
@@ -155,13 +140,13 @@ Sys.setenv(PROJ_LIB = "C:/Program Files/R/R-4.4.1/library/terra/proj")
 library(terra)
 library(rhdf5)          # low-level NEON H5 reading
 library(geometry)        # convhulln for CHV
-library(randomForest)
+library(reticulate)      # adaptive-FCM SSR bridge (Section 5), adaptive_fcm_ssr.py
 library(cluster)
 library(dplyr)
 library(stringr)
 library(purrr)
 library(tibble)
- 
+
 # ============================================================================
 # 0. Setup
 # ============================================================================
@@ -170,21 +155,63 @@ out_csv       <- "D:/projects/moore/SpectralBiodiversity/Data/spectral_diversity
 
 buffer_m           <- 500   # single buffer for ALL metrics (CV, CHV, SSR, RaoQ x3)
 ndvi_thresh         <- 0.4
-n_clusters           <- 50  # spectral species richness ceiling -- see Section 5's
-                             # OPEN PROBLEM: nearest-centroid richness still trends
-                             # toward this value on real, continuously-varying data
-                             # (confirmed insensitive to real cluster separation in
-                             # synthetic tests -- kmeans always fills all n_clusters
-                             # partitions). Two candidates for a future session, to
-                             # be weighed with real ABBY/SRER data, not decided here:
-                             # lowering n_clusters itself, or a principled minimum-
-                             # occupancy criterion. Neither implemented yet.
 n_subsample_pixels   <- 2500
 n_pc_ssr             <- 4
 n_pc_chv             <- 3
 n_reps_ssr           <- 20
 raoq_window          <- 3   # side of the square moving window for local Rao's Q (Section 6)
 raoq_pca_var_threshold <- 0.99   # variance fraction to retain when PCA-reducing all-bands Rao's Q (Section 6a)
+
+# ---- Adaptive-FCM spectral species richness config (Section 5) ----
+# ALL VALUES BELOW ARE PROVISIONAL -- see Section 5's header. Kept as named
+# constants (not buried inline) so a follow-up session can change them
+# without hunting through the function body.
+c_max_ssr       <- 20    # unchanged from diagnostics; primary search always
+                          # runs c in [2, c_max_ssr] (see select_winning_c()).
+fcm_fuzziness_w <- 2.0   # PROVISIONAL -- standard/default FCM fuzziness
+                          # exponent (Wu et al.'s w), not tuned for this data.
+gap_check_c_max <- 8     # PROVISIONAL -- c range [1, gap_check_c_max] tested
+                          # by the gap-statistic fallback (Section 5) when a
+                          # rep's primary search lands at the c=2 floor. Only
+                          # meant to adjudicate c=1 vs. small c, not to re-run
+                          # the full [2, c_max_ssr] search -- see Section 5.
+gap_check_n_null <- 10   # null (uniform-random) references per candidate c
+                          # in the gap-statistic fallback.
+adaptive_fcm_py <- "./Code/DataAnalysis/adaptive_fcm_ssr.py"
+
+# ============================================================================
+# 0a. Python/FCM environment check -- printed unconditionally at the VERY TOP
+#     of execution, before towers_df or anything else is read (not only on
+#     failure), so an unattended weekend run's log clearly shows which
+#     Python/reticulate environment was actually used, for later debugging
+#     if results look off. Fails HERE, before any site-year work starts,
+#     rather than deep into a multi-hour loop.
+# ============================================================================
+if (!file.exists(adaptive_fcm_py)) {
+  stop("Required input not found: ", adaptive_fcm_py)
+}
+
+cat("==== reticulate Python configuration ====\n")
+print(py_config())
+cat("==========================================\n\n")
+
+if (!py_module_available("numpy")) {
+  stop("Python module 'numpy' is not importable via reticulate. Check ",
+       "RETICULATE_PYTHON / reticulate::py_config() above before running ",
+       "the real loop -- do not proceed on a guess.")
+}
+if (!py_module_available("fcmeans")) {
+  stop("Python module 'fcmeans' (PyPI package 'fuzzy-c-means') is not ",
+       "importable via reticulate. Install it in whatever Python ",
+       "reticulate is pointed at (e.g. `pip install fuzzy-c-means`), or ",
+       "point RETICULATE_PYTHON at an environment that already has it, ",
+       "before running the real loop -- do not proceed on a guess.")
+}
+source_python(adaptive_fcm_py)   # exposes adaptive_fcm_ssr(), fcm_validity_L(), FCM
+                                   # (the fcmeans.FCM class) -- NOT _fit_one(), which
+                                   # source_python() does not bind (leading underscore);
+                                   # see select_winning_c()'s header (Section 5).
+cat("  numpy: available\n  fcmeans (fuzzy-c-means): available\n\n")
 
 towers_df <- read.csv("./Data/NEONsites.csv", fileEncoding = "UTF-8-BOM") %>%
   mutate(neon_site = str_extract(Site.Name, "(?<=\\()[A-Za-z0-9]{4}(?=\\)\\s*$)")) %>%
@@ -389,100 +416,319 @@ compute_cha <- function(r, veg_mask) {
 }
 
 # ============================================================================
-# 5. Metric 3: Spectral Species Richness (reused from ComputeSpecBiodiv.R),
-#    plus spectral Shannon's index H' and its Hill-number effective
-#    diversity exp(H'), reusing the SAME per-rep classifier output --
-#    NOT a separate classification pass.
+# 5. Metric 3: Spectral Species Richness -- self-adaptive fuzzy c-means
+#    (FCM), Wu et al. 2026 (Computers and Electronics in Agriculture
+#    252:112108), plus spectral Shannon's index H' and its Hill-number
+#    effective diversity exp(H'), reusing the SAME per-rep FCM output -- NOT
+#    a separate classification pass. See the file header for why the prior
+#    RF-proximity + K-means + nearest-centroid approach was removed entirely
+#    (it is NOT preserved below, not even as a fallback).
 # ============================================================================
-# Returns a named list, not a single scalar: list(richness, shannon_h,
-# shannon_effective). Every call site MUST unpack all three (see Section 8)
-# -- treating the return value as a bare number will silently coerce the
-# list's first element only in some contexts and error in others, rather
-# than doing the wrong thing quietly, but don't rely on that; unpack
-# explicitly.
+# Returns a named list: list(richness, shannon_h, shannon_effective,
+# mean_winning_c, max_winning_c, n_reps_gap_check_triggered, primary_time_sec,
+# gap_time_sec). Every call site MUST unpack all eight (see Section 8) --
+# unpack explicitly, don't rely on partial-match coercion.
 #
-# assign_nearest_centroid(): vectorized nearest-centroid assignment (Feret &
-# Asner 2014, Ecological Applications 24:1289-1296, the paper that
-# originated the "spectral species" method). Every row of `x` (n x d) is
-# assigned to whichever row of `centers` (k x d) is closest by Euclidean
-# distance. Uses the ||x-c||^2 = ||x||^2 - 2 x.c + ||c||^2 expansion so the
-# full n x k squared-distance matrix comes from one matrix multiply, not a
-# per-pixel loop -- flexclust::dist2() would do the same thing but isn't
-# installed and isn't worth adding as a new dependency for this.
-assign_nearest_centroid <- function(x, centers) {
-  x <- as.matrix(x); centers <- as.matrix(centers)
-  x_sq <- rowSums(x^2)
-  c_sq <- rowSums(centers^2)
-  d2 <- outer(x_sq, c_sq, "+") - 2 * (x %*% t(centers))
-  max.col(-d2, ties.method = "first")
+# ALL PARAMETERS THIS FUNCTION IS CALLED WITH (Section 0's c_max_ssr,
+# fcm_fuzziness_w, gap_check_c_max, gap_check_n_null) ARE PROVISIONAL --
+# flagged there, not repeated here.
+#
+# SHANNON'S H' POPULATION-SCOPE CAVEAT: unlike the removed k-means version's
+# H' (computed over a FULL-population nearest-centroid reassignment), this
+# H' is computed over the winning c's HARD assignment (argmax of fuzzy
+# membership, or the single group for c=1) of that rep's SUBSAMPLE only --
+# there is no full-population reassignment step for FCM here (see
+# compute_spectral_species_richness_fcm() below). Same formula as before,
+# NOT the same population scope -- a genuine change in what H' measures, not
+# just in method, inherited unchanged from the FCM_test.R diagnostic this
+# replaces.
+#
+# select_winning_c() (PRIMARY SEARCH, c in [2, c_max]): reuses
+# adaptive_fcm_ssr.py's own, UNMODIFIED fcm_validity_L() (actual
+# validity-function arithmetic) AND the same `fcmeans.FCM` class that
+# module's own (private) _fit_one() calls internally -- calling
+# `FCM(n_clusters=c, m=fuzziness, random_state=..., verbose=FALSE);
+# model$fit(X); model$u; model$centers` directly here (via fit_fcm(), shared
+# with the gap-statistic fallback below for the fit step only -- see that
+# function's header) reproduces _fit_one()'s exact body (confirmed by
+# reading adaptive_fcm_ssr.py's source), NOT a different or reimplemented
+# fitting routine, and uses the identical FCM class object that module
+# imports. _fit_one() itself could not be called directly here -- confirmed
+# empirically that reticulate::source_python() does not bind
+# underscore-prefixed Python names into R at all (only fcm_validity_L,
+# adaptive_fcm_ssr, and FCM appear after sourcing the module; a leading
+# underscore is Python's own "not public API" convention, and reticulate
+# respects it), so calling it was never actually an option regardless of
+# preference -- this is the closest available reuse of the module's real
+# fitting code without editing the file.
+#
+# THE C=1 FLOOR-CHECK BRANCH THAT USED TO LIVE HERE HAS BEEN REMOVED, NOT
+# PATCHED. It compared c=1's raw within-cluster dispersion against
+# min(within-cluster dispersion across c=2..c_max) and returned c=1 iff that
+# was smaller. Self-testing on synthetic homogeneous data (pure Gaussian
+# noise, no real substructure) found this branch essentially unwinnable: it
+# never won across 5 reps, because fuzzy within-cluster dispersion is
+# MONOTONICALLY DECREASING in c even for pure noise (more fuzzy prototypes
+# mechanically reduce total weighted squared-distance-to-nearest-center
+# regardless of whether the extra prototypes fit real signal or just noise
+# -- the same reason k-means SSE is monotonically non-increasing in k), so
+# the multi-cluster side of that comparison was always anchored near
+# c_max's value and c=1 essentially never beat it. That branch is GONE
+# (previously: `if (c_min == 1) { within_1 <- ...; if (within_1 <=
+# min_within_ge2) return(list(winning_c = 1L, ...)) }`), replaced below by
+# the conditional gap-statistic rule.
+#
+# GAP-STATISTIC FALLBACK (Tibshirani, Walther & Hastie 2001, JRSS-B
+# 63:411-423), conditional -- NOT run for every rep. The full gap-statistic
+# check (null-reference generation + FCM fits across gap_check_n_null
+# references x multiple candidate c) is too expensive to run unconditionally
+# for every rep of every site-year -- it would meaningfully undercut the
+# compute savings that motivated dropping k-means in the first place. So
+# it's gated: it only runs for a rep whose PRIMARY search (select_winning_c,
+# c in [2, c_max]) lands exactly at the c=2 floor (argmax_c L(c) == 2). For
+# every other rep (winning c == 3, 4, ..., c_max), the primary search's
+# result is used directly and the gap check never runs.
+#
+# When triggered, compute_gap_statistic() tests c in [1, gap_check_c_max]
+# (a SMALLER, reduced range than the primary search's [2, c_max] -- the
+# point is only to adjudicate c=1 vs. small c, not to re-run the full
+# search) using gap_check_n_null uniform-random null references per
+# candidate c, generated within the OBSERVED subsample's own per-PC-dimension
+# min/max range (Tibshirani's simpler reference method, not a PCA-realigned
+# bounding box). W_k for the gap statistic is the RAW POOLED WITHIN-CLUSTER
+# SUM OF SQUARED DISTANCES UNDER HARD ASSIGNMENT (argmax of FCM's fuzzy
+# membership matrix, or the single group for c=1) -- see fit_hard_wk()
+# below. This is a DIFFERENT quantity from select_winning_c()'s fuzzy-
+# weighted `within_norm`, computed differently (raw hard-assignment SS to a
+# cluster's own mean, vs. u^fuzziness-weighted squared distance to the FCM
+# prototype) -- the two are not interchangeable and the code below does not
+# try to share anything between them beyond the FCM fit call itself
+# (fit_fcm()).
+#
+# Optimal-c selection (pick_optimal_c(), below): finds the GLOBAL maximum of
+# Gap(c) across the tested range first, then picks the SMALLEST c whose Gap
+# is within one standard error (sk) of that global max -- NOT a naive
+# left-to-right scan from c=1, which breaks on a non-monotonic Gap curve
+# (confirmed by self-test below against a synthetic dip-before-peak Gap
+# sequence).
+#
+# If the gap check picks c=1 for a rep: that rep's richness value is 1,
+# entered into the site-year's richness average like any other rep's value
+# (simple mean across all n_reps reps, unchanged). If it picks c>=2: that c
+# is used (the gap statistic's answer, not the primary search's c=2, since
+# it's the more rigorous check when it has actually been run -- the two
+# usually agree in that case, but if they don't, the gap check's result
+# wins).
+fit_fcm <- function(X, c, fuzziness, seed) {
+  model <- FCM(n_clusters = as.integer(c), m = fuzziness,
+               random_state = as.integer(seed), verbose = FALSE)
+  model$fit(X)
+  model
 }
 
-compute_spectral_species_richness <- function(r, veg_mask, n_clusters = 50,
-                                              n_subsample = 2500, n_pc = 4,
-                                              n_reps = 20) {
+select_winning_c <- function(pcs_sub, c_max, fuzziness, seed) {
+  L_vals <- setNames(numeric(c_max - 1), as.character(2:c_max))
+  u_by_c <- list()
+
+  for (c in 2:c_max) {
+    model <- fit_fcm(pcs_sub, c, fuzziness, seed + c)
+    u <- model$u; centers <- model$centers
+    L_vals[as.character(c)] <- fcm_validity_L(pcs_sub, u, centers, fuzziness)
+    u_by_c[[as.character(c)]] <- u
+  }
+
+  finite_L <- L_vals[is.finite(L_vals)]
+  if (length(finite_L) == 0) {
+    stop("select_winning_c: L(c) was non-finite for every candidate c in ",
+         "[2, ", c_max, "] -- investigate the input/fit, do not guess a winner.")
+  }
+  winning_c <- as.integer(names(which.max(finite_L)))
+
+  list(winning_c = winning_c,
+       hard = max.col(u_by_c[[as.character(winning_c)]], ties.method = "first"))
+}
+
+# Purely a log(0) guard for fit_hard_wk() below -- NOT a science/tuning
+# parameter (unlike Section 0's PROVISIONAL c_max_ssr/fcm_fuzziness_w/
+# gap_check_* constants), so kept separate from that block. W_k=0 happens
+# iff every point in every hard-assigned cluster coincides EXACTLY with
+# that cluster's own centroid -- a degenerate edge case (e.g. an exact
+# duplicate point pair collapsing to a singleton "cluster", or a genuinely
+# zero-variance PC subsample), vanishingly unlikely on continuous
+# reflectance PC data but not impossible across an unattended, multi-day,
+# 45-site x multiple-year x n_reps_ssr-rep run. Without this floor,
+# log(W_k) -> -Inf and silently propagates into that candidate c's Gap(c),
+# which is a worse failure mode than a loud one -- it wouldn't stop the run
+# or necessarily be obvious in the output, but could corrupt that rep's
+# Gap(c)/pick_optimal_c() result.
+epsilon_wk <- 1e-10
+
+# Raw pooled within-cluster sum of squared distances under HARD assignment,
+# for one candidate c on one data matrix X -- the gap statistic's W_k
+# (Tibshirani et al. 2001), computed via each hard cluster's OWN mean (not
+# the FCM prototype), which for squared Euclidean distance is algebraically
+# identical to that paper's sum-of-pairwise-distances/(2*n_r) formulation
+# (the standard implementation convention, e.g. cluster::clusGap). c=1 is
+# handled directly (no FCM fit needed): a single group, dispersion around
+# the global mean. Returns list(wk, hard) -- `hard` is kept so the caller
+# can reuse the OBSERVED side's cluster assignment for Shannon's H' without
+# a second fit, if this c is the one that ultimately wins.
+#
+# epsilon_wk floor applied at ONE finalization point below (after either
+# branch computes its raw wk, before either returns) -- not duplicated
+# across the c==1 / c>=2 branches. This only guards the exact-W_k==0 edge
+# case; it does not meaningfully perturb wk for any non-degenerate cluster
+# (1e-10 vs. any real-data sum-of-squared-distances is negligible). Logs a
+# cat() (this file's established progress-logging convention, not a hard
+# failure) when it actually engages, so the edge case is visible in an
+# unattended run's log rather than silently smoothed over.
+fit_hard_wk <- function(X, c, fuzziness, seed) {
+  n <- nrow(X)
+  if (c == 1) {
+    centroid <- colMeans(X)
+    wk <- sum(rowSums(sweep(X, 2, centroid) ^ 2))
+    hard <- rep(1L, n)
+  } else {
+    model <- fit_fcm(X, c, fuzziness, seed)
+    hard <- max.col(model$u, ties.method = "first")
+    wk <- 0
+    for (k in seq_len(c)) {
+      idx <- which(hard == k)
+      if (length(idx) == 0) next
+      pts <- X[idx, , drop = FALSE]
+      centroid <- if (length(idx) == 1) pts[1, ] else colMeans(pts)
+      wk <- wk + sum(rowSums(sweep(pts, 2, centroid) ^ 2))
+    }
+  }
+
+  if (wk < epsilon_wk) {
+    cat("    WARNING: fit_hard_wk() W_k hit the epsilon floor for c=", c,
+        " -- cluster(s) collapsed to their centroid exactly (raw wk=", wk, ").\n", sep = "")
+    wk <- epsilon_wk
+  }
+
+  list(wk = wk, hard = hard)
+}
+
+# Gap(c) = mean_b[log(W_k,null_b)] - log(W_k,observed), sk = sd(log(W_k,null))
+# * sqrt(1 + 1/n_null), for c in c_range -- Tibshirani et al. 2001's simpler
+# (non-PCA-aligned) uniform reference distribution, bounded to the OBSERVED
+# subsample's own per-dimension min/max range. Returns list(gap_df, hard_by_c)
+# -- hard_by_c holds the OBSERVED side's per-c hard assignment (indexed by
+# fit_hard_wk() above), for the caller to pick up once pick_optimal_c() has
+# decided the winning c, without a second fit.
+compute_gap_statistic <- function(pcs_sub, c_range, fuzziness, seed, n_null = 10) {
+  n_pixels <- nrow(pcs_sub); n_dims <- ncol(pcs_sub)
+  dim_min <- apply(pcs_sub, 2, min)
+  dim_range <- apply(pcs_sub, 2, max) - dim_min
+
+  observed <- lapply(c_range, function(c) fit_hard_wk(pcs_sub, c, fuzziness, seed + c))
+  names(observed) <- as.character(c_range)
+  wk_observed <- vapply(observed, function(o) o$wk, numeric(1))
+
+  log_wk_null <- matrix(NA_real_, nrow = n_null, ncol = length(c_range))
+  for (b in seq_len(n_null)) {
+    ref <- matrix(runif(n_pixels * n_dims), nrow = n_pixels, ncol = n_dims)
+    ref <- sweep(sweep(ref, 2, dim_range, "*"), 2, dim_min, "+")
+    for (ci in seq_along(c_range)) {
+      null_seed <- seed + 100000L + b * 1000L + c_range[ci]
+      log_wk_null[b, ci] <- log(fit_hard_wk(ref, c_range[ci], fuzziness, null_seed)$wk)
+    }
+  }
+
+  gap <- colMeans(log_wk_null) - log(wk_observed)
+  sk  <- apply(log_wk_null, 2, sd) * sqrt(1 + 1 / n_null)
+
+  list(gap_df = tibble(c = c_range, gap = gap, sk = sk), hard_by_c = observed)
+}
+
+# Global-max-then-1SE rule, NOT a left-to-right scan (which stops early on
+# any dip before the true peak -- see this function's self-test below).
+pick_optimal_c <- function(gap_df) {
+  gap_df <- gap_df %>% arrange(c)
+  i_max <- which.max(gap_df$gap)
+  threshold <- gap_df$gap[i_max] - gap_df$sk[i_max]
+  candidates <- gap_df$c[gap_df$gap >= threshold]
+  min(candidates)
+}
+
+compute_spectral_species_richness_fcm <- function(r, veg_mask, c_max = 20,
+                                                    fuzziness = 2.0, n_subsample = 2500,
+                                                    n_pc = 4, n_reps = 20, seed_base = 0,
+                                                    gap_c_max = 8, gap_n_null = 10) {
+  # SAME masking + PCA recipe as the removed k-means version -- identical
+  # PC-space inputs, only the clustering/search step differs.
   r_masked <- mask(r, veg_mask)
   vals <- values(r_masked, na.rm = TRUE)
-  if (nrow(vals) < n_subsample) n_subsample <- nrow(vals)
-  if (nrow(vals) < n_clusters) {
-    return(list(richness = NA_real_, shannon_h = NA_real_, shannon_effective = NA_real_))
+  this_n_subsample <- n_subsample
+  if (nrow(vals) < this_n_subsample) this_n_subsample <- nrow(vals)
+  if (nrow(vals) <= c_max) {
+    return(list(richness = NA_real_, shannon_h = NA_real_, shannon_effective = NA_real_,
+                mean_winning_c = NA_real_, max_winning_c = NA_real_,
+                n_reps_gap_check_triggered = NA_integer_,
+                primary_time_sec = NA_real_, gap_time_sec = NA_real_))
   }
 
   pca <- prcomp(vals, center = TRUE, scale. = FALSE)
   pcs_all <- pca$x[, 1:n_pc]
 
-  richness_reps <- numeric(n_reps)
-  shannon_reps  <- numeric(n_reps)
+  richness_reps  <- numeric(n_reps)
+  shannon_reps   <- numeric(n_reps)
+  winning_c_reps <- integer(n_reps)
+  gap_triggered  <- logical(n_reps)
+  primary_time_sec <- 0
+  gap_time_sec     <- 0
+
   for (rep_i in seq_len(n_reps)) {
-    sub_idx <- sample(seq_len(nrow(pcs_all)), n_subsample)
-    pcs_sub <- pcs_all[sub_idx, ]
+    sub_idx <- sample(seq_len(nrow(pcs_all)), this_n_subsample)
+    pcs_sub <- pcs_all[sub_idx, , drop = FALSE]
 
-    rf <- randomForest(x = pcs_sub, ntree = 500, proximity = TRUE)
-    prox_dist <- as.dist(1 - rf$proximity)
-    km <- kmeans(cmdscale(prox_dist, k = n_pc), centers = n_clusters, nstart = 10)
+    t0 <- Sys.time()
+    sel <- select_winning_c(pcs_sub, c_max = c_max, fuzziness = fuzziness,
+                             seed = seed_base + rep_i * 1000L)
+    primary_time_sec <- primary_time_sec + as.numeric(difftime(Sys.time(), t0, units = "secs"))
 
-    # Nearest-centroid assignment (Feret & Asner 2014) in place of a second
-    # trained classifier -- see the header comment above and the file header
-    # for why: a trained multi-class RF's decision regions tile the entire
-    # PC space and almost always hit every n_clusters label somewhere, which
-    # was saturating richness at n_clusters regardless of real spectral
-    # diversity. Nearest-centroid has no such bias -- richness legitimately
-    # comes out below n_clusters when pixels cluster near only a few
-    # centroids.
-    #
-    # Centroids for this step must be km's 50 CLUSTER LABELS re-expressed in
-    # PC space, NOT km$centers directly -- km$centers are centroids of the
-    # cmdscale(prox_dist) embedding (RF-proximity-based MDS coordinates), a
-    # different coordinate system from pcs_all, not merely a rescaling of it
-    # (confirmed empirically during validation: for a pcs_sub range of
-    # roughly +-75, the corresponding cmdscale/km$centers range was roughly
-    # +-0.07). Computing Euclidean nearest-centroid between pcs_all and
-    # km$centers would compare two unrelated spaces and, confirmed by the
-    # synthetic regression tests below, does not reproduce the intended
-    # fix (a homogeneous synthetic population still saturated near
-    # n_clusters=50). Re-deriving each cluster's PC-space centroid as the
-    # mean, in pcs_sub's own coordinates, of the subsample points that km
-    # assigned to it keeps the RF-proximity + MDS + kmeans clustering step
-    # exactly as specified while making the subsequent nearest-centroid
-    # assignment geometrically meaningful.
-    pc_centroids <- rowsum(pcs_sub, group = km$cluster) / as.numeric(table(km$cluster))
-    cluster_all <- assign_nearest_centroid(pcs_all, pc_centroids)
+    if (sel$winning_c == 2) {
+      gap_triggered[rep_i] <- TRUE
+      t0 <- Sys.time()
+      gap_result <- compute_gap_statistic(pcs_sub, c_range = 1:min(gap_c_max, c_max),
+                                           fuzziness = fuzziness,
+                                           seed = seed_base + rep_i * 1000L + 500000L,
+                                           n_null = gap_n_null)
+      gap_time_sec <- gap_time_sec + as.numeric(difftime(Sys.time(), t0, units = "secs"))
 
-    richness_reps[rep_i] <- length(unique(cluster_all))
+      optimal_c <- pick_optimal_c(gap_result$gap_df)
+      final_c    <- optimal_c
+      final_hard <- gap_result$hard_by_c[[as.character(optimal_c)]]$hard
+    } else {
+      final_c    <- sel$winning_c
+      final_hard <- sel$hard
+    }
 
-    # Spectral Shannon's index (Wang et al. 2018, RSE 211:218-228, Table 2):
-    # H' = -sum(p_i * ln(p_i)) over the proportion of pixels assigned to
-    # each spectral-species cluster. Only clusters actually assigned appear
-    # in table() here (unlike the old factor-level classifier output), so
-    # there are no zero-count levels to drop -- but the tbl[tbl > 0] guard is
-    # kept regardless, since 0*ln(0) is NaN in R, not the mathematical
-    # convention's 0.
-    tbl <- table(cluster_all)
-    p_i <- as.numeric(tbl[tbl > 0]) / length(cluster_all)
+    winning_c_reps[rep_i] <- final_c
+    # final_c (primary argmax_c L(c), or the gap statistic's answer when the
+    # c=2-floor fallback triggered) IS this rep's richness value directly --
+    # no full-population reassignment step, unlike the removed k-means
+    # version (see this function's header caveat).
+    richness_reps[rep_i]  <- final_c
+
+    # Spectral Shannon's index (Wang et al. 2018, RSE 211:218-228, Table 2),
+    # same formula as the removed k-means version, different population
+    # scope -- see this function's header caveat. For c=1 (single group),
+    # p_i = 1 and H' = 0, same formula, no special case needed.
+    tbl <- table(final_hard)
+    p_i <- as.numeric(tbl[tbl > 0]) / length(final_hard)
     shannon_reps[rep_i] <- -sum(p_i * log(p_i))
   }
+
   list(richness = mean(richness_reps),
        shannon_h = mean(shannon_reps),
-       shannon_effective = mean(exp(shannon_reps)))
+       shannon_effective = mean(exp(shannon_reps)),
+       mean_winning_c = mean(winning_c_reps),
+       max_winning_c = max(winning_c_reps),
+       n_reps_gap_check_triggered = sum(gap_triggered),
+       primary_time_sec = primary_time_sec,
+       gap_time_sec = gap_time_sec)
 }
 
 # ============================================================================
@@ -549,7 +795,7 @@ compute_spectral_species_richness <- function(r, veg_mask, n_clusters = 50,
 # dist() call (~350 bands, 500x500: ~6s; scales roughly linearly with pixel
 # count from there) -- on the order of tens of seconds to low minutes per
 # site-year for all three Rao's Q variants combined, well under the cost of
-# the spectral-species-richness step (RF + K-means, n_reps_ssr reps) above.
+# the spectral-species-richness step (adaptive-FCM, n_reps_ssr reps) above.
 # ----------------------------------------------------------------------------
 # 6a. PCA-based band reduction, ALL-BANDS Rao's Q ONLY.
 # ----------------------------------------------------------------------------
@@ -687,11 +933,22 @@ if (nrow(inventory) == 0) {
 }
 cat("=================================================================\n\n")
 
+# YEAR-MAJOR ordering: all available sites for the earliest year first, then
+# all sites for the next year, and so on -- NOT the tower-major (all years
+# for one site, then the next site) order this loop used previously. Reuses
+# `inventory` (Section 7 above; identical tower_id/year pairs to
+# site_years_files) sorted by year first, tower second, so an interrupted
+# weekend run has touched a spread of sites at each year rather than
+# exhausting one site's full year range before starting the next site. Each
+# job's list(tower_id=, year=, files=) entry is constructed identically to
+# before -- only the iteration order changed.
 site_year_jobs <- list()
-for (tid in names(site_years_files)) {
-  df <- site_years_files[[tid]]
-  if (nrow(df) == 0) next
-  for (yr in sort(unique(df$year))) {
+if (nrow(inventory) > 0) {
+  inventory_ordered <- inventory %>% arrange(year, tower_id)
+  for (i in seq_len(nrow(inventory_ordered))) {
+    tid <- inventory_ordered$tower_id[i]
+    yr  <- inventory_ordered$year[i]
+    df  <- site_years_files[[tid]]
     site_year_jobs[[length(site_year_jobs) + 1]] <- list(
       tower_id = tid, year = yr, files = df$file[df$year == yr]
     )
@@ -710,6 +967,8 @@ results <- tibble(
   tower_id = character(), neon_site = character(), year = character(),
   cv = double(), chv = double(), chv_standardized = double(), cha = double(),
   spectral_species_richness = double(), shannon_h = double(), shannon_effective = double(),
+  ssr_mean_winning_c = double(), ssr_max_winning_c = double(),
+  n_reps_gap_check_triggered = integer(),
   raoq_ndvi = double(), raoq_nirv = double(), raoq_allbands = double(),
   status = character()
 )
@@ -733,6 +992,8 @@ for (j in seq_along(site_year_jobs)) {
       tibble(tower_id = tower_id, neon_site = neon_site, year = yr,
              cv = NA_real_, chv = NA_real_, cha = NA_real_,
              spectral_species_richness = NA_real_, shannon_h = NA_real_, shannon_effective = NA_real_,
+             ssr_mean_winning_c = NA_real_, ssr_max_winning_c = NA_real_,
+             n_reps_gap_check_triggered = NA_integer_,
              raoq_ndvi = NA_real_, raoq_nirv = NA_real_, raoq_allbands = NA_real_,
              status = "no reflectance data")
     } else {
@@ -748,12 +1009,21 @@ for (j in seq_along(site_year_jobs)) {
       cat("  computing CV...\n");  cv_val  <- compute_cv(r, veg_mask)
       cat("  computing CHV...\n"); chv_val <- compute_chv(r, veg_mask, n_pc_chv)
       cat("  computing CHA...\n"); cha_val <- compute_cha(r, veg_mask)
-      cat("  computing spectral species richness + Shannon's H' (", n_reps_ssr, " reps)...\n", sep = "")
-      ssr_result <- compute_spectral_species_richness(r, veg_mask, n_clusters,
-                                                    n_subsample_pixels, n_pc_ssr, n_reps_ssr)
-      ssr_val         <- ssr_result$richness
-      shannon_h_val   <- ssr_result$shannon_h
-      shannon_eff_val <- ssr_result$shannon_effective
+      cat("  computing spectral species richness (adaptive-FCM) + Shannon's H' (", n_reps_ssr, " reps)...\n", sep = "")
+      job_seed_base <- 20260101L + j * 1000L
+      ssr_result <- compute_spectral_species_richness_fcm(r, veg_mask, c_max_ssr,
+                                                    fcm_fuzziness_w, n_subsample_pixels,
+                                                    n_pc_ssr, n_reps_ssr, seed_base = job_seed_base,
+                                                    gap_c_max = gap_check_c_max, gap_n_null = gap_check_n_null)
+      ssr_val             <- ssr_result$richness
+      shannon_h_val        <- ssr_result$shannon_h
+      shannon_eff_val      <- ssr_result$shannon_effective
+      ssr_mean_wc_val      <- ssr_result$mean_winning_c
+      ssr_max_wc_val       <- ssr_result$max_winning_c
+      n_gap_triggered_val  <- ssr_result$n_reps_gap_check_triggered
+      cat(sprintf("    gap-statistic fallback triggered on %d/%d reps -- primary search %.1fs, gap fallback %.1fs\n",
+                   n_gap_triggered_val, n_reps_ssr,
+                   ssr_result$primary_time_sec, ssr_result$gap_time_sec))
 
       cat("  computing Rao Q (NDVI), local moving-window...\n")
       raoq_ndvi <- compute_rao_q_raster_local(mask(ndvi, veg_mask), raoq_window)
@@ -770,6 +1040,8 @@ for (j in seq_along(site_year_jobs)) {
       tibble(tower_id = tower_id, neon_site = neon_site, year = yr,
              cv = cv_val, chv = chv_val, cha = cha_val,
              spectral_species_richness = ssr_val, shannon_h = shannon_h_val, shannon_effective = shannon_eff_val,
+             ssr_mean_winning_c = ssr_mean_wc_val, ssr_max_winning_c = ssr_max_wc_val,
+             n_reps_gap_check_triggered = n_gap_triggered_val,
              raoq_ndvi = raoq_ndvi, raoq_nirv = raoq_nirv, raoq_allbands = raoq_all,
              status = status)
     }
@@ -778,6 +1050,8 @@ for (j in seq_along(site_year_jobs)) {
     tibble(tower_id = tower_id, neon_site = neon_site, year = yr,
            cv = NA_real_, chv = NA_real_, cha = NA_real_,
            spectral_species_richness = NA_real_, shannon_h = NA_real_, shannon_effective = NA_real_,
+           ssr_mean_winning_c = NA_real_, ssr_max_winning_c = NA_real_,
+           n_reps_gap_check_triggered = NA_integer_,
            raoq_ndvi = NA_real_, raoq_nirv = NA_real_, raoq_allbands = NA_real_,
            status = paste("error:", conditionMessage(e)))
   })
@@ -793,6 +1067,7 @@ for (j in seq_along(site_year_jobs)) {
     mutate(chv_standardized = (chv - mean(chv, na.rm = TRUE)) / sd(chv, na.rm = TRUE)) %>%
     select(tower_id, neon_site, year, cv, chv, chv_standardized, cha,
            spectral_species_richness, shannon_h, shannon_effective,
+           ssr_mean_winning_c, ssr_max_winning_c, n_reps_gap_check_triggered,
            raoq_ndvi, raoq_nirv, raoq_allbands, status)
 
   # save incrementally so a crash/interruption partway through doesn't lose

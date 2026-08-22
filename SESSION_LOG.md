@@ -4,6 +4,394 @@ Committed, dated record of work performed in this repository. Reverse
 chronological order, newest entry at the top. See CLAUDE.md for the
 convention this file follows.
 
+## 2026-08-22 21:32 UTC — AnnualSpectralDiversity.R: epsilon floor for fit_hard_wk()'s log(0) edge case
+
+Small, targeted follow-up to the gap-statistic entry directly below this
+one, closing one of that session's own flagged-but-not-fixed robustness
+concerns: `fit_hard_wk()`'s `W_k` could hit exactly 0 if every point in a
+hard-assigned cluster coincides exactly with that cluster's own centroid,
+producing `log(W_k) = -Inf` inside the Gap(c) calculation -- silently, not
+as a crash, which is a worse failure mode across an unattended 45-site x
+multi-year x n_reps_ssr-rep run.
+
+**Fix**: a single named constant, `epsilon_wk <- 1e-10` (defined just above
+`fit_hard_wk()`, explicitly separated from Section 0's PROVISIONAL
+science/tuning constants since this is a numerical-safety floor, not a
+methodological choice), applied at ONE finalization point inside
+`fit_hard_wk()` -- after both its c==1 and c>=2 branches compute their raw
+`wk`, before either returns -- not duplicated across the two branches. Logs
+a `cat()` (matching this file's established progress-logging convention;
+no `warning()` used anywhere else in the file) when the floor actually
+engages, so the edge case is visible in an unattended run's log rather than
+smoothed over silently.
+
+**Self-tested in this sandbox, four checks, all passed:**
+1. A degenerate synthetic case (20 identical points, `c=1`) forced `wk=0`
+   exactly; confirmed `log(wk)` is finite after the fix (no `-Inf`).
+2. Confirmed the `cat()` warning fired exactly once for that call, with the
+   correct candidate-c value in the message.
+3. Confirmed silence on ordinary data: a normal synthetic 20x4 random
+   matrix produced no floor message and `wk` many orders of magnitude above
+   `epsilon_wk`.
+4. Ran the full `compute_gap_statistic()` + `pick_optimal_c()` path on a
+   fully-degenerate observed matrix (forcing the floor for every candidate
+   c in 1:4) -- completed without error, every `Gap(c)`/`sk` value finite
+   (all landed at exactly 0, as expected when observed and null W_k are
+   both floored identically), `pick_optimal_c()` returned a valid c with no
+   crash.
+
+**Non-perturbation check**: compared `fit_hard_wk()`'s `wk` output with vs.
+without the floor, same input/seed, directly (not via two independent
+`compute_gap_statistic()` calls -- an earlier attempt at this comparison
+spuriously showed a real-looking difference, traced to
+`compute_gap_statistic()`'s null-reference generation using unseeded
+`runif()`/`rnorm()`, so two separate calls draw different null data
+regardless of the floor; not a bug in the fix, a flaw in that first test's
+design). Direct comparison on ordinary 4-blob synthetic data, c=1..6: `wk`
+values were bit-identical (relative difference exactly 0 in every case) --
+the floor is a true no-op for any non-degenerate input.
+
+File still `parse()`s cleanly. No other part of the gap-statistic logic,
+`pick_optimal_c()`, or the conditional c=2-floor gating was touched, per
+instruction.
+
+**This entry and the code change it describes have NOT been committed or
+pushed** -- same working-tree-only convention as the two entries below.
+
+## 2026-08-22 21:25 UTC — AnnualSpectralDiversity.R: replace the dead c=1 floor-check with a conditional gap-statistic rule
+
+`Code/AnnualSpectralDiversity.R` (Section 5) already had SSR switched from
+RF+K-means to self-adaptive FCM in the working tree from a prior,
+still-uncommitted session (see the entry below this one). That version
+included a c=1 "floor-check" branch meant to catch an apparent c=2 floor
+artifact on real SRER data (every rep's L(c) maximized at c=2, no interior
+peak, unlike ABBY's genuine interior peak at c~6-8) -- but that branch's own
+self-test found it essentially unwinnable: fuzzy within-cluster dispersion
+decreases monotonically in c even for pure noise, so c=1 almost never beat
+the best of c=2..20. **This session removed that branch entirely** (not
+patched) and replaced it with a conditional gap-statistic rule (Tibshirani,
+Walther & Hastie 2001), per explicit task instructions reporting that the
+gap statistic had been validated elsewhere against real ABBY/SRER data
+(ABBY -> c~5, matching its independent L(c) peak; SRER -> c=1, genuinely
+homogeneous) -- **that real-data validation was NOT reproduced in this
+sandbox** (no server/data access here); only the synthetic self-tests below
+were run in this session.
+
+**The removed branch, for the record:** compared c=1's raw within-cluster
+dispersion (mean squared distance to the global mean, per-pixel-normalized)
+against `min(within-cluster dispersion across c=2..c_max)` and returned c=1
+iff that was smaller -- `if (within_1 <= min_within_ge2) return(list(winning_c
+= 1L, ...))`. Gone, along with the `c_min_ssr` config constant and the
+`within_norm` dispersion tracking it depended on.
+
+**Replacement design, conditional not unconditional (cost-motivated):**
+running the full gap-statistic check (null-reference generation + FCM fits
+across `gap_check_n_null` references x multiple candidate c) for every rep
+of every site-year would meaningfully erode the compute savings that
+motivated dropping k-means in the first place. So it only runs for a rep
+whose PRIMARY search (`select_winning_c()`, unchanged: c in [2, c_max_ssr]
+via L(c) maximization) lands exactly at the c=2 floor. Every other rep uses
+the primary search's result directly, unchanged. When triggered:
+`compute_gap_statistic()` tests c in [1, `gap_check_c_max`=8] (a reduced
+range -- only meant to adjudicate c=1 vs. small c, not re-run the full
+search) against `gap_check_n_null`=10 uniform-random null references per
+candidate c, generated within the observed subsample's own per-PC-dimension
+min/max range (Tibshirani's simpler reference method). `W_k` is the RAW
+POOLED WITHIN-CLUSTER SUM OF SQUARED DISTANCES UNDER HARD ASSIGNMENT (argmax
+of FCM's fuzzy membership, via a new `fit_hard_wk()` helper) -- a genuinely
+different quantity from the primary search's fuzzy-weighted `within_norm`
+(now removed); the two share only the underlying FCM fit call
+(`fit_fcm()`, factored out for both), not the objective computation.
+`pick_optimal_c()` implements the global-max-then-1SE rule specified in the
+task (find the global max of Gap(c) first, then the smallest c within one
+SE of it) -- explicitly NOT a left-to-right scan from c=1, which was
+confirmed broken by this session's own synthetic test (see below).
+
+**Self-tested in this sandbox (no server access), three ways, all passed:**
+1. `pick_optimal_c()` against a synthetic dip-before-peak Gap(c) sequence
+   (mimicking ABBY's reported real shape -- dips at c=2, true peak at c=5):
+   correctly picked c=5 (the global max); a hand-written left-to-right-scan
+   variant, run side by side for contrast, incorrectly stopped at c=1 --
+   concretely confirming the dip-early-stop failure mode the task described.
+2. `compute_gap_statistic()` + `pick_optimal_c()` directly, on genuinely
+   synthetic homogeneous noise (500 pts, 4 dims) vs. genuinely synthetic
+   5-blob multi-cluster data (500 pts, 4 dims, well-separated): resolved to
+   c=1 for the homogeneous case and c=5 for the blobs case (exactly matching
+   the true blob count, not just >1) -- the gap statistic's own correctness,
+   independent of whether the primary search happens to trigger it.
+3. **The conditional wiring itself**, forced: this session's synthetic
+   homogeneous/multi-cluster data did NOT naturally reproduce SRER's
+   reported real-data behavior of the primary search landing at exactly
+   c=2 (probed across multiple seeds/dimensionalities -- primary search
+   winning_c on pure Gaussian noise here ranged c=3-20, never settling at
+   2; likely a property of real SRER's specific spectral PC structure, not
+   reproducible with generic synthetic noise). To still test the gate
+   itself, `select_winning_c()` was monkey-patched inside a test-only copy
+   of the function environment to always return winning_c=2, then the full
+   `compute_spectral_species_richness_fcm()` wrapper was run end-to-end on
+   both scenarios: gap check triggered on 3/3 reps in both (confirming the
+   gate fires whenever primary search reports c=2, as designed), and the
+   richness that actually came out was 1 for the homogeneous case and 5 for
+   the blobs case (the gap statistic's answer, not the forced primary c=2)
+   -- confirming the resolved c, not the c=2 stand-in, is what flows into
+   the final richness/Shannon's H' values.
+
+Also confirmed: the file still `parse()`s cleanly; sourced directly, it
+still runs through Section 0/0a (library loads, FCM/numpy availability
+check, resolved `py_config()` printed) exactly as before and stops at the
+same expected point (missing `./Data/NEONsites.csv`) -- nothing upstream of
+the real data read was broken by this change. Grepped the whole file for
+orphaned references to `n_clusters` (as our own removed variable, not
+`fcmeans.FCM`'s constructor arg of the same name -- that one's legitimate),
+`randomForest`, `kmeans`, `assign_nearest_centroid`, and the old
+pre-FCM `compute_spectral_species_richness()` -- none found; all remaining
+hits are explanatory comments about what was removed and why. Fixed one
+stale comment (Section 6's Rao's Q runtime note still said "RF + K-means,
+n_reps_ssr reps" after the earlier FCM-adoption session's edits) while in
+the area.
+
+**Confirmed unchanged, per the task's explicit "do not touch" list:**
+`c_max_ssr`=20, `fcm_fuzziness_w`=2.0, `n_subsample_pixels`=2500,
+`n_reps_ssr`=20, `buffer_m`, `ndvi_thresh`, `n_pc_ssr` -- all untouched. CV,
+CHV, CHA, and all three Rao's Q variants -- untouched. Year-major job
+ordering (Section 7/8, `inventory %>% arrange(year, tower_id)`) -- already
+in place from the prior session, confirmed intact, not re-touched.
+Incremental full-table `write.csv()` after every completed job (Section 8)
+-- confirmed intact and unaffected by this change. FCM availability
+pre-check (`py_module_available("fcmeans")`/`"numpy"`, `stop()` before the
+main loop if missing) and the unconditional `print(py_config())` at the top
+-- confirmed still present (Section 0a), unmodified.
+
+**New output column**: `n_reps_gap_check_triggered` (out of `n_reps_ssr`),
+added to `results`' schema and all three tibble-construction branches
+(success / no-reflectance-data / error), reporting per site-year how many
+reps hit the c=2 floor and triggered the fallback. Also added a per-site-year
+`cat()` line in the main loop reporting reps-triggered plus primary-search
+vs. gap-fallback wall-clock seconds (`primary_time_sec`/`gap_time_sec`,
+accumulated across reps inside `compute_spectral_species_richness_fcm()`).
+
+**Design choice, flagged rather than silently decided**: the gap-statistic
+code lives directly in `AnnualSpectralDiversity.R` (Section 5), not a
+separate sourced file. `adaptive_fcm_ssr.py` was deliberately left
+untouched per instruction, and the gap check's hard-assignment `W_k` is a
+different-enough quantity from that module's fuzzy `L(c)` that bridging it
+through Python would mean a second, narrowly-scoped Python function for
+what's a small amount of R-side logic already reusing `fit_fcm()`'s single
+Python call -- putting it in R alongside `select_winning_c()` (which it
+directly gates on) keeps the conditional trigger, the two objective
+functions, and their shared FCM-fit dependency in one place. A future
+session could still split it out if the file grows unwieldy.
+
+**Robustness concerns for an unattended multi-day run, flagged but NOT
+fixed (logic calls, not mechanical fixes):**
+- `fit_hard_wk()`'s `log(wk)` can hit `log(0) = -Inf` if a candidate c's
+  hard-assignment clusters land pixels EXACTLY on their own centroid (wk=0)
+  -- vanishingly unlikely on continuous reflectance PC data but not
+  impossible on a degenerate subsample; would produce an `Inf`/`NaN` Gap
+  value for that c. Not guarded, matching how Tibshirani's own reference
+  implementations (e.g. `cluster::clusGap`) handle it -- an explicit
+  epsilon-floor or c-skip would be a real behavior change, flagged for a
+  decision rather than added unrequested.
+- The gap-statistic fallback's cost is only bounded per-rep, not per-site-
+  year or globally -- a pathological site-year where EVERY rep lands at the
+  c=2 floor pays the full `gap_check_c_max * (1 + gap_check_n_null)` extra
+  fits `n_reps_ssr` times over, with no circuit breaker. The new
+  `n_reps_gap_check_triggered` column and per-site-year timing line make
+  this visible after the fact, but nothing stops it from happening during
+  an unattended run -- worth watching the first few real site-years'
+  printed gap-fallback timing before assuming it stays cheap everywhere.
+- `select_winning_c()`'s `stop()` on all-non-finite `L(c)` (unchanged from
+  the prior session) still aborts that rep's whole computation rather than
+  NA-ing just that rep -- same behavior as before this change, not
+  reintroduced, just noting it's still there for an unattended run.
+- This session's synthetic self-tests could not reproduce SRER's reported
+  real-data c=2-floor behavior on generic Gaussian noise (see self-test #3
+  above) -- meaning the conditional gate's trigger condition itself
+  (`winning_c == 2`) has only been verified by direct code inspection plus
+  a forced/monkey-patched test, not by a naturally-occurring synthetic
+  case. The real trigger rate on actual SRER/ABBY data this weekend is the
+  first real confirmation that the gate fires as intended in production.
+
+**This entry, and the code change it describes, have NOT been committed or
+pushed** -- per this session's explicit instructions and this project's
+commit-only-when-asked convention. Both are sitting in the working tree
+alongside the still-uncommitted prior FCM-adoption change (entry below).
+
+## 2026-08-20 UTC — Add FCM_test.R: adaptive-FCM SSR diagnostic, companion to KMeans_test.R's n_clusters sweep
+
+New script, `Code/DataAnalysis/FCM_test.R`, run in the same R session as
+`AnnualSpectralDiversity.R` (same convention as `KMeans_test.R`, which it is
+a direct companion to). Where `KMeans_test.R` sweeps `n_clusters` through the
+existing RF-proximity + k-means + nearest-centroid SSR to check whether
+lowering `k` restores ABBY/SRER separation, this script asks the same
+question with self-adaptive fuzzy c-means (FCM, Wu et al. 2026) instead: per
+rep, cluster count `c` is chosen by maximizing a validity function `L(c)`
+over `c` in `[2, 20]`. Reuses (does not duplicate) `adaptive_fcm_ssr.py`,
+already written and unit-tested in the prior session for
+`CompareSSR_AdaptiveFCM_vs_KMeans.R`; extended it to also return each rep's
+hard cluster assignment (`hard_assignment`, argmax of fuzzy membership) so
+`FCM_test.R` can compute a Shannon's H' in the same formula as the k-means
+version's. `KMeans_test.R`, `AnnualSpectralDiversity.R`, and
+`ComputeSpecBiodiv.R` were read but not modified.
+
+**Two structural asymmetries vs. the k-means version, both by explicit
+instruction rather than oversight, flagged prominently in the script
+header:** (1) richness here is simply the winning `c` per rep -- there is no
+analog of the k-means version's full-population nearest-centroid
+reassignment step, so the two richness values are not measuring the same
+thing underneath a shared name; (2) Shannon's H' uses the SAME formula but is
+computed over the winning c's hard-assigned SUBSAMPLE only, not a
+full-population reassignment like the k-means version's H' -- comparable in
+formula, not in population scope. Both are called out so a future
+side-by-side read of the two scripts' `shannon_h` columns isn't
+misinterpreted as apples-to-apples.
+
+**Self-tested (no server/`Data/` access in this sandbox), two ways:**
+1. Lightweight synthetic gate -- 5 well-separated Gaussian blobs vs. a
+   homogeneous single cluster, run directly through the same
+   `adaptive_fcm_ssr()` call `compute_spectral_species_richness_fcm()` uses
+   per rep: blobs -> winning c per rep `5,5,6,6,5` (mean 5.4); homogeneous ->
+   `4,5,4,2,2` (mean 3.4). Passed (homogeneous clearly below blobs, nowhere
+   near the c=20 cap).
+2. Full mock-harness run -- `get_tower_reflectance()` replaced with a mock
+   returning synthetic ABBY/SRER-shaped rasters (deliberately built with
+   more spectral groups and higher veg fraction for the mocked ABBY than
+   SRER), run through the ENTIRE script at real production settings (2500-px
+   subsample, 20 reps, all 6 site-years). Caught one real bug this way:
+   `pivot_wider()` (final summary table) needs `tidyr`, which neither this
+   script nor `AnnualSpectralDiversity.R` loads -- fixed by adding
+   `library(tidyr)` to `FCM_test.R`. Flagged as a LATENT GAP in
+   `KMeans_test.R` too (it also calls `pivot_wider()` with no `library(tidyr)`
+   anywhere upstream in its own dependency chain) -- worth checking whether
+   the server run of `KMeans_test.R` hit the same failure at its final print
+   step. On the mock data itself, both mocked sites' richness landed at the
+   floor (c=2) with no separation -- almost certainly an artifact of the
+   mock's per-pixel noise swamping its deliberately-injected group signal,
+   not a script bug (the clean synthetic gate above, run on unambiguous
+   blob/homogeneous structure with no injected noise, is the real
+   correctness check). Runtime observed on the mock: ~53 sec/site-year for
+   the 3091-veg-pixel mocked ABBY, ~21 sec/site-year for the 1055-pixel
+   mocked SRER (subsample capped at population size) -- same order of
+   magnitude as the script's own pre-loop calibration estimate (~0.9
+   min/site-year, ~5.7 min projected total across 6 site-years), which is
+   itself only a synthetic-data-timing floor, not a guarantee against real
+   reflectance PC data.
+
+**Assumptions/dependencies to confirm on the server, per instruction:**
+`w=2.0` (standard/default, not tuned); `c` capped at `[2,20]`; hard-vs-soft
+H' assignment (explicit instruction, not a claim hard assignment is
+"correct" for FCM's fuzzy output); `fcmeans`/numpy reachable by `reticulate`
+(the script now checks this itself, before the site-year loop, and stops
+with a clear message if not -- tested in this sandbox against
+`fuzzy-c-means==2.0.2`); the new `library(tidyr)` requirement above.
+
+## 2026-08-20 UTC — Add CompareSSR_AdaptiveFCM_vs_KMeans.R: self-adaptive fuzzy c-means SSR vs. the existing fixed-k nearest-centroid SSR, ABBY/SRER
+## 2026-08-20 UTC — Add CompareSSR_AdaptiveFCM_vs_KMeans.R: self-adaptive fuzzy c-means SSR vs. the existing fixed-k nearest-centroid SSR, ABBY/SRER
+
+New script, `Code/DataAnalysis/CompareSSR_AdaptiveFCM_vs_KMeans.R`, plus a new
+Python helper module, `Code/DataAnalysis/adaptive_fcm_ssr.py`. Compares two
+DIFFERENT definitions of Spectral Species Richness (SSR) side by side on real
+ABBY/SRER data: the existing fixed-`n_clusters=50` RF-proximity + k-means +
+nearest-centroid SSR (`AnnualSpectralDiversity.R`, unchanged, called
+read-only as baseline) against a new self-adaptive fuzzy c-means (FCM) SSR
+(Wu et al. 2026, *Computers and Electronics in Agriculture* 252:112108),
+where the cluster count `c` is chosen per window (here: per tower-year,
+whole-buffer) by maximizing a validity function `L(c)` trading fuzzy
+between-cluster separation against fuzzy within-cluster dispersion, searched
+over `c` in `[2, 20]` -- deliberately capped well under the old 50, since
+that ceiling is exactly what caused the original saturation problem. **No
+server data access in this sandbox; only the script was written and the
+synthetic-validation gate was run. The real ABBY/SRER comparison, and
+whether it actually resolves the saturation problem, is a next-session
+task once the user runs this on the server.**
+
+**Three factual corrections made to the task prompt before writing anything,
+verified against the actual repo contents rather than assumed:**
+1. The task said to reuse `FieldDiversity.R` for pixel extraction via
+   `import_functions_from()`. False -- `FieldDiversity.R` is ground-plot
+   floristic diversity and, by its own header, never reads reflectance
+   values. The real extraction pipeline (`get_tower_reflectance`,
+   `compute_ndvi_raster`, `discover_site_years`, and the baseline
+   `compute_spectral_species_richness()` itself) lives in
+   `AnnualSpectralDiversity.R`, and that is what's imported, via the same
+   `import_functions_from()` bootstrap `ComputeLUE.R`/`ComputeLUE_Annual.R`
+   already established (and called as `spec_fns$name(...)`, matching their
+   call style, not dumped into the global environment).
+2. The task said SSR is "already implemented in Python" in this repo and to
+   match an existing "CV/CHA in R + SSR in Python" split. False -- SSR is
+   pure R everywhere in this repo; the only prior Python bridge
+   (reticulate + pyGNDiv, for Rao's Q) lived in the older
+   `ComputeSpecBiodiv.R` and was deliberately dropped in
+   `AnnualSpectralDiversity.R` for a pure-R implementation (that script's own
+   Section 6 header: didn't scale to continuous ~1m data). Still bridged to
+   Python here anyway, via `reticulate::source_python()`, because Wu et al.
+   themselves used the `fcmeans` (PyPI `fuzzy-c-means`) package and
+   reproducing their method means using the same fitting code -- but this is
+   a new, narrowly-scoped bridge, not a pre-existing pattern being followed.
+3. The task asked for "one row per plot/window combination." The existing
+   SSR pipeline has no sub-buffer windowing concept at all -- one richness
+   value per whole tower-year buffer. Introducing a new window size/stride
+   would make the two methods' outputs NOT comparable to the existing CSV
+   (a different spatial support), contradicting the stated goal. This script
+   therefore treats the whole per-tower-year buffer as the single window for
+   both methods (`window_id` is always `"whole_buffer"`) -- flagged as an
+   open decision if finer, sub-buffer windows are actually wanted later.
+
+**Validity-function implementation** (`adaptive_fcm_ssr.py`): implements
+`L(c) = [sum_i sum_j u_ij^w ||v_i-xbar||^2 / (c-1)] / [sum_i sum_j u_ij^w
+||x_j-v_i||^2 / (m-c)]` directly from `fcmeans.FCM`'s fitted `.u`/`.centers`,
+vectorized (no per-pixel loop, same `||x-c||^2`-expansion technique
+`AnnualSpectralDiversity.R`'s `assign_nearest_centroid()` already uses).
+Flagged a real name collision in the module docstring: the paper's `w`
+(fuzziness exponent) is the `fcmeans.FCM` constructor's `m` argument, and the
+paper's `m` (window pixel count) is unrelated -- the code always spells these
+out as `fuzziness`/`n_pixels`, never a bare `m`.
+
+**Synthetic validation gate (task's Section 4) -- RUN in this sandbox, PASSED:**
+using the same kind of scenario the original k-means saturation bug was
+diagnosed with (SESSION_LOG entry below, 2026-08-1x-ish: 5 well-separated
+Gaussian blobs vs. a homogeneous single cluster, 10000 pixels, 4 PCs), run
+through the script's actual `adaptive_fcm_ssr_window()` wrapper at the exact
+settings configured for the real run (`c` in `[2,20]`, `w=2`, 1000-pixel
+subsample, 5 reps): blobs -> winning c per rep `5,6,5,5,5`, richness 5;
+homogeneous -> winning c per rep `2,4,3,4,2`, richness 3. Both gate checks
+passed (homogeneous < blobs; homogeneous well clear of the c=20 cap).
+Total gate runtime ~11 sec for both scenarios combined. Also ran a separate
+smoke test of the full main-loop code path (NDVI/veg-mask/bad-band-mask via
+the imported functions, PCA extraction, both SSR computations) against a
+synthetic terra raster shaped like `get_tower_reflectance()`'s real output --
+all steps ran and returned sane values; this is NOT a substitute for a real
+ABBY/SRER run, only a structural/syntax check.
+
+**Assumptions flagged for the user to confirm before trusting a full run**
+(also in the script's own header): fuzziness `w=2.0` (standard/default, not
+tuned); `c` capped at `[2,20]` per the task's explicit instruction;
+FCM subsample (1000 px) and rep count (5) both LOWER than the existing
+k-means step's (2500 px, 20 reps) -- a real precision/cost tradeoff, made
+because fitting FCM for 19 candidate `c` values per rep is far more
+expensive than one k-means fit, not a neutral default; output paths
+(`D:/projects/moore/SpectralBiodiversity/Data/...`) copied from
+`AnnualSpectralDiversity.R`'s own convention, not independently confirmed.
+**Python dependency, unconfirmed on the server:** `fuzzy-c-means` (imports as
+`fcmeans`) + numpy, reachable by `reticulate`. In this sandbox, reticulate
+initially failed against a statically-linked python3 with no loadable
+`libpython*.so`; had to point `RETICULATE_PYTHON` at a system `/usr/bin/
+python3` build with a proper shared library before `fuzzy-c-means` (pip
+`--user`-installed there) would import -- the server's Python/reticulate
+setup should be checked for the same class of failure before assuming this
+just works.
+
+Non-goals honored: `AnnualSpectralDiversity.R` and its output CSV were never
+modified (only imported/read); the PCA-vs-fixed-band-index question was not
+touched; no decision was made about adopting adaptive-FCM SSR as a new
+default -- that's explicitly left for the next session once real ABBY/SRER
+results are in.
+
+**This entry has NOT yet been committed/pushed** -- per this session's
+git-safety instructions, commits are made only when the user explicitly asks;
+flagging here so it isn't lost, but the user (or a follow-up instruction)
+needs to trigger the actual commit.
+
 ## 2026-08-20 UTC — Add ComputeLUE_Annual.R: annual-resolution LUE, a separate ratio-based method alongside (not replacing) ComputeLUE.R
 
 New script, `Code/DataAnalysis/ComputeLUE_Annual.R`. Computes LUE from
