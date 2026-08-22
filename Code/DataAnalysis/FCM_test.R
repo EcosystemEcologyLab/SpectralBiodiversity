@@ -350,3 +350,276 @@ cat("\nCompare this table against KMeans_test.R's own 2017 ABBY-vs-SRER print (s
     " same PC-space) once both scripts have finished -- fixed-k SSR showed ABBY ~ SRER (no",
     " separation) in prior diagnostics; the question this script exists to answer is whether",
     " adaptive-FCM richness/mean_winning_c shows real separation instead.\n", sep = "")
+#=====================================
+#=====================================
+#=====================================
+# ============================================================================
+# Elbow-consistency check: is the within-cluster dispersion drop from c=1->2
+# meaningfully LARGER than the typical drop from c->c+1 elsewhere in the
+# range (c=2->3, 3->4, ... 19->20)? If 1->2's improvement is just "business
+# as usual" -- comparable to any other adjacent step -- there's no real
+# elbow at c=2, and c=1 should be treated as at least as defensible a
+# choice. If 1->2's improvement is a clear outlier (much bigger than the
+# typical step), that's evidence 2 really is doing something c=1 can't.
+#
+# This replaces the old c=1-vs-min(c=2..20) comparison, which was flawed --
+# within-cluster dispersion mechanically shrinks as c grows (more centroids
+# always let points snap closer to SOMETHING), so c=1 could essentially
+# never beat c=20 regardless of whether real structure existed.
+#
+# Reuses curve_df_both from the prior diagnostic chunk (must be run in the
+# same session, or reload it first) -- no new FCM computation needed.
+# ============================================================================
+
+elbow_check <- curve_df_both %>%
+  filter(!is.na(within)) %>%          # keep c=1..20 rows (L is NA only for c=1)
+  arrange(label, rep, c) %>%
+  group_by(label, rep) %>%
+  mutate(
+    within_prev = lag(within),
+    drop = within_prev - within,      # improvement from adding one more cluster
+    step = paste0(lag(c), "->", c)
+  ) %>%
+  filter(!is.na(drop)) %>%
+  ungroup()
+
+# For each rep: compare the 1->2 drop against the median drop across all
+# OTHER adjacent steps (2->3 through 19->20) in that same rep.
+elbow_summary <- elbow_check %>%
+  group_by(label, rep) %>%
+  summarise(
+    drop_1_to_2   = drop[step == "1->2"],
+    median_other_drops = median(drop[step != "1->2"]),
+    ratio = drop_1_to_2 / median_other_drops,   # >>1 means 1->2 is a real
+    .groups = "drop"                             # outlier improvement;
+  )                                               # ~1 means "business as usual"
+
+cat("==== Elbow check: is c=1->2's improvement a real outlier, or typical? ====\n")
+print(elbow_summary, n = Inf)
+
+cat("\n==== Summary by site ====\n")
+elbow_summary %>%
+  group_by(label) %>%
+  summarise(mean_ratio = mean(ratio), median_ratio = median(ratio), .groups = "drop") %>%
+  print()
+
+cat("\nInterpretation guide:\n",
+    "  ratio >> other adjacent-step ratios (e.g. several-fold larger than 1) =>\n",
+    "    c=2 offers a real improvement over c=1; c=2 is a defensible answer.\n",
+    "  ratio ~ 1 (comparable to typical step-to-step improvement) =>\n",
+    "    1->2 isn't special; c=1 (homogeneous) is at least as defensible.\n",
+    "Compare ABBY's ratio (expected large, given its confirmed interior peak\n",
+    "at c~6-8) against SRER's ratio directly -- that contrast is the real test.\n",
+    sep = "")
+
+# Bonus: print each rep's FULL sequence of adjacent-step drops so you can see
+# the 1->2 drop in context against the whole declining curve, not just a
+# single summary ratio.
+cat("\n==== Full step-by-step drop sequence per rep (for visual context) ====\n")
+elbow_check %>%
+  select(label, rep, step, drop) %>%
+  print(n = Inf)
+#=========================================
+#========================================
+#=========================================
+# ============================================================================
+# Gap statistic (Tibshirani, Walther & Hastie 2001): the principled fix for
+# the c=1-vs-c>=2 comparison the last two checks couldn't make.
+#
+# WHY: raw within-cluster dispersion (used by the last elbow check) decays in
+# an almost universal geometric-ish shape as c grows, REGARDLESS of whether
+# real cluster structure exists -- confirmed empirically last chunk (ABBY and
+# SRER showed near-identical 1->2 : 2->3 decay ratios despite very different
+# underlying structure). The gap statistic fixes this by comparing observed
+# within-cluster dispersion against a NULL REFERENCE (data with no real
+# structure, same spread/dimensionality) AT EACH c, rather than comparing
+# different c values to each other directly. The "gap" is
+#   Gap(c) = mean_over_null_reps[ log(W_null(c)) ] - log(W_observed(c))
+# A genuine elbow shows up as a peak/plateau in Gap(c); pure noise shows a
+# flat or monotonically-uninformative Gap(c). This automatically controls for
+# the generic decay shape, since both W_null and W_observed decay the same
+# generic way and that shared component cancels out in the difference.
+#
+# W_k here (per Tibshirani's canonical definition) is the RAW pooled within-
+# cluster sum of squared distances under HARD assignment (argmax of FCM's
+# fuzzy membership) -- NOT the same normalized/fuzzy-weighted "within" used
+# by compute_validity_L() in the earlier chunks. This is a deliberate
+# methodological choice: the gap statistic's derivation assumes this specific
+# raw form, and mixing it with the fuzzy-weighted L(c) denominator would
+# invalidate the null-reference comparison. Null reference data is generated
+# uniformly within the per-column min/max range of the OBSERVED subsample
+# (Tibshirani's simpler reference method (a); does not attempt the
+# PCA-realigned bounding box variant (b), which would be a false precision
+# here since pcs_sub is already PCA output).
+#
+# COST WARNING: this fits FCM once per (rep x c x [1 observed + n_null
+# reference]) combination. Default settings below (n_check_reps=3, n_null=10,
+# c_range=1:8) mean ~3 x 8 x 11 = 264 FCM fits PER SITE, ~528 total for both
+# sites. Based on the earlier calibration (~1.6 sec/fit), expect roughly
+# 10-15 minutes total -- a runtime estimate is printed before the full loop
+# commits, same as prior diagnostics.
+#
+# c_range is capped at 8 (not 20) deliberately: the real question is c=1 vs
+# c=2, and ABBY's already-confirmed L(c) peak at c~6-8 (prior chunk) gives a
+# built-in sanity check -- if the gap statistic ALSO picks something in the
+# 6-8 range for ABBY, that's independent confirmation the method is working
+# correctly, not just an artifact of this specific check.
+#
+# Must be run in the same session as the prior diagnostic chunks (reuses
+# fcmeans_mod, site_year_jobs, get_tower_reflectance, compute_ndvi_raster,
+# ndvi_thresh, n_subsample_pixels, n_pc_ssr).
+# ============================================================================
+
+# ---- raw pooled within-cluster sum of squares under HARD assignment ----
+compute_Wk_hard <- function(pcs, c, fuzziness = 2.0, random_state = 0L) {
+  if (c == 1) {
+    center <- matrix(colMeans(pcs), nrow = 1)
+    d2 <- rowSums(sweep(pcs, 2, center[1, ], "-")^2)
+    return(sum(d2))
+  }
+  fcm <- fcmeans_mod$FCM(n_clusters = as.integer(c), m = fuzziness,
+                         random_state = as.integer(random_state))
+  fcm$fit(pcs)
+  u <- fcm$u
+  centers <- fcm$centers
+  hard <- apply(u, 1, which.max)   # hard assignment: argmax membership
+  
+  Wk <- 0
+  for (i in seq_len(c)) {
+    idx <- which(hard == i)
+    if (length(idx) == 0) next
+    d2 <- rowSums(sweep(pcs[idx, , drop = FALSE], 2, centers[i, ], "-")^2)
+    Wk <- Wk + sum(d2)
+  }
+  Wk
+}
+
+# ---- gap statistic for one rep: observed vs n_null uniform references ----
+run_gap_statistic_rep <- function(pcs_sub, c_range, n_null, fuzziness, seed_base) {
+  # observed
+  logW_obs <- numeric(length(c_range))
+  for (ci in seq_along(c_range)) {
+    c_val <- c_range[ci]
+    Wk <- compute_Wk_hard(pcs_sub, c_val, fuzziness, random_state = seed_base + c_val)
+    logW_obs[ci] <- log(Wk)
+  }
+  
+  # null references: uniform within observed per-column min/max range
+  col_min <- apply(pcs_sub, 2, min)
+  col_max <- apply(pcs_sub, 2, max)
+  n_pts <- nrow(pcs_sub)
+  n_dim <- ncol(pcs_sub)
+  
+  logW_null <- matrix(NA_real_, nrow = n_null, ncol = length(c_range))
+  for (b in seq_len(n_null)) {
+    set.seed(seed_base + 5000 + b)
+    ref <- matrix(runif(n_pts * n_dim), nrow = n_pts, ncol = n_dim)
+    ref <- sweep(ref, 2, col_max - col_min, "*")
+    ref <- sweep(ref, 2, col_min, "+")
+    for (ci in seq_along(c_range)) {
+      c_val <- c_range[ci]
+      Wk <- compute_Wk_hard(ref, c_val, fuzziness,
+                            random_state = seed_base + 6000 + b * 100 + c_val)
+      logW_null[b, ci] <- log(Wk)
+    }
+  }
+  
+  mean_logW_null <- colMeans(logW_null)
+  sd_logW_null <- apply(logW_null, 2, sd)
+  gap <- mean_logW_null - logW_obs
+  sk <- sd_logW_null * sqrt(1 + 1 / n_null)
+  
+  tibble(c = c_range, logW_obs = logW_obs, mean_logW_null = mean_logW_null,
+         gap = gap, sk = sk)
+}
+
+# ---- pick optimal c via Tibshirani's standard 1-SE rule: smallest c such
+#      that Gap(c) >= Gap(c+1) - sk(c+1). Falls back to argmax(gap) if no c
+#      in range satisfies the rule (i.e. gap is still rising at the c_max
+#      tested -- true optimum may be beyond this range). ----
+pick_optimal_c <- function(gap_df) {
+  gap_df <- gap_df %>% arrange(c)
+  for (i in seq_len(nrow(gap_df) - 1)) {
+    if (gap_df$gap[i] >= gap_df$gap[i + 1] - gap_df$sk[i + 1]) {
+      return(gap_df$c[i])
+    }
+  }
+  gap_df$c[which.max(gap_df$gap)]   # fallback
+}
+
+# ---- runner: multiple reps for one site-year ----
+run_gap_check <- function(tower_id, year, label, n_check_reps = 3, n_null = 10,
+                          c_range = 1:8, fuzziness = 2.0, seed_offset = 0) {
+  job <- keep(site_year_jobs, ~ .x$tower_id == tower_id & .x$year == year)[[1]]
+  neon_site <- towers_df$neon_site[towers_df$Site.ID == job$tower_id]
+  
+  cat("\n\n======== GAP STATISTIC: ", label, ": ", tower_id, "(", neon_site, ")", year,
+      " ========\n", sep = "")
+  data <- get_tower_reflectance(job$tower_id, job$files, buffer_m)
+  r <- data$raster; wl <- data$wavelengths
+  ndvi <- compute_ndvi_raster(r, wl)
+  veg_mask <- ifel(ndvi > ndvi_thresh, 1, NA)
+  
+  r_masked <- mask(r, veg_mask)
+  vals <- values(r_masked, na.rm = TRUE)
+  pca <- prcomp(vals, center = TRUE, scale. = FALSE)
+  pcs_all <- pca$x[, 1:n_pc_ssr]
+  
+  rep_results <- list()
+  for (rep_i in seq_len(n_check_reps)) {
+    set.seed(seed_offset + rep_i)
+    sub_idx <- sample(seq_len(nrow(pcs_all)), n_subsample_pixels)
+    pcs_sub <- pcs_all[sub_idx, , drop = FALSE]
+    
+    cat("\n-- rep", rep_i, "--\n")
+    t0 <- Sys.time()
+    gap_df <- run_gap_statistic_rep(pcs_sub, c_range, n_null, fuzziness,
+                                    seed_base = seed_offset + rep_i * 10000)
+    elapsed <- round(difftime(Sys.time(), t0, units = "secs"), 1)
+    
+    for (i in seq_len(nrow(gap_df))) {
+      cat("   c =", sprintf("%d", gap_df$c[i]),
+          " Gap =", format(gap_df$gap[i], digits = 5),
+          " (sk =", format(gap_df$sk[i], digits = 4), ")\n")
+    }
+    optimal_c <- pick_optimal_c(gap_df)
+    cat("   >> optimal c (1-SE rule):", optimal_c, " (", elapsed, "sec )\n", sep = "")
+    
+    rep_results[[rep_i]] <- gap_df %>% mutate(rep = rep_i, label = label, optimal_c = optimal_c)
+  }
+  
+  bind_rows(rep_results)
+}
+
+# ---- runtime estimate before committing to the full run ----
+cat("==== Gap statistic runtime estimate ====\n")
+cat("  Per rep: ~", length(1:8) * (1 + 10), " FCM fits. At ~1.6 sec/fit (prior calibration),\n",
+    "  expect ~", round(length(1:8) * 11 * 1.6 / 60, 1), " min/rep.\n", sep = "")
+cat("  Full run (3 reps x 2 sites): ~", round(3 * 2 * length(1:8) * 11 * 1.6 / 60, 1),
+    " min total. (Rough estimate -- real data may fit faster/slower than synthetic calibration.)\n\n", sep = "")
+
+# ---- run both sites ----
+abby_gap_df <- run_gap_check("US-xAB", "2017", "ABBY", n_check_reps = 3, n_null = 10,
+                             c_range = 1:8, seed_offset = 93000)
+srer_gap_df <- run_gap_check("US-xSR", "2017", "SRER", n_check_reps = 3, n_null = 10,
+                             c_range = 1:8, seed_offset = 94000)
+
+gap_df_both <- bind_rows(abby_gap_df, srer_gap_df)
+
+# ---- summary: optimal c per rep, per site ----
+cat("\n\n==== Summary: gap-statistic optimal c per rep ====\n")
+gap_df_both %>%
+  distinct(label, rep, optimal_c) %>%
+  group_by(label) %>%
+  summarise(optimal_c_values = paste(optimal_c, collapse = ", "),
+            mean_optimal_c = mean(optimal_c), .groups = "drop") %>%
+  print()
+
+cat("\nInterpretation:\n",
+    "  If SRER's optimal c comes out at 1 (or clusters near 1) while ABBY's comes\n",
+    "  out near its already-confirmed L(c) peak (~6-8), that's strong, methodologically\n",
+    "  independent confirmation: SRER genuinely has no meaningful spectral subdivision,\n",
+    "  and ABBY's multi-cluster structure is real, not a shared artifact of the method.\n",
+    "  If SRER's optimal c comes out >1 here too, the c=2 result may be more defensible\n",
+    "  than suspected -- worth taking seriously rather than assuming it's still an artifact.\n",
+    sep = "")
