@@ -40,12 +40,25 @@
 # ==============================================================================
 #
 # CREDENTIALS: AppEEARS requires an Earthdata Login (free account at
-# https://urs.earthdata.nasa.gov/). Read from EARTHDATA_USERNAME /
-# EARTHDATA_PASSWORD environment variables -- NEVER hardcoded here. Set them
-# in your ~/.Renviron (already gitignored in this repo -- confirmed against
-# .gitignore before choosing this: `.Renviron` is listed alongside
-# `.Rproj.user`/`.Rhistory`/`.RData`/`.Ruserdata`, so no new gitignore entry
-# was needed) or in the shell environment before running this script.
+# https://urs.earthdata.nasa.gov/). This account has MFA enabled (email +
+# authenticator app), and AppEEARS' password-based /login endpoint has no way
+# to accept a second factor, so auth here is TOKEN-ONLY: generate a long-lived
+# Earthdata User Token once via the Earthdata profile's "Generate Token" page
+# (https://urs.earthdata.nasa.gov/ -> profile -> Generate Token -- that page
+# authenticates through the browser, where MFA can actually be entered), then
+# use that token directly as the bearer token for every AppEEARS API call,
+# with no /login step at all.
+#
+# Set it as EARTHDATA_TOKEN in your ~/.Renviron (already gitignored in this
+# repo -- confirmed against .gitignore before choosing this: `.Renviron` is
+# listed alongside `.Rproj.user`/`.Rhistory`/`.RData`/`.Ruserdata`, so no new
+# gitignore entry was needed) or in the shell environment before running this
+# script. NOTE: `.Renviron` changes only take effect in a NEW R session --
+# `Sys.getenv()` does not pick up edits made after the current session
+# started, so restart R after adding/changing it. These tokens typically
+# expire after a few months -- if auth suddenly starts failing after
+# previously working, regenerate the token via the same "Generate Token" page
+# and update EARTHDATA_TOKEN in .Renviron.
 #
 # PRODUCTS/LAYERS (collection .061, the current MODIS collection as of this
 # writing -- confirm this is still current when you run this):
@@ -224,18 +237,6 @@ parse_appeears_csv <- function(raw_df, coord_xwalk, value_layer, qc_layer, qc_de
 # ============================================================================
 # 4. AppEEARS API calls (UNTESTED -- see header caveat)
 # ============================================================================
-appeears_login <- function(username, password) {
-  resp <- request(paste0(appeears_base_url, "/login")) %>%
-    req_method("POST") %>%
-    req_auth_basic(username, password) %>%
-    req_retry(max_tries = 3) %>%
-    req_perform()
-  token <- resp_body_json(resp)$token
-  if (is.null(token)) stop("AppEEARS login response did not contain a 'token' field -- ",
-                            "response shape differs from assumed; inspect resp_body_json(resp).")
-  token
-}
-
 build_task_body <- function(task_name, start_date, end_date, coord_xwalk_full) {
   layers <- list(
     list(product = fpar_product, layer = fpar_layer),
@@ -337,16 +338,16 @@ download_appeears_results <- function(token, task_id, dest_dir) {
 # 5. Main orchestration (UNTESTED end-to-end -- see header caveat)
 # ============================================================================
 run_extract_modis <- function() {
-  earthdata_username <- Sys.getenv("EARTHDATA_USERNAME")
-  earthdata_password <- Sys.getenv("EARTHDATA_PASSWORD")
-  if (!nzchar(earthdata_username) || !nzchar(earthdata_password)) {
-    stop("EARTHDATA_USERNAME and EARTHDATA_PASSWORD must be set (e.g. in ~/.Renviron,",
-         " already gitignored in this repo) -- Earthdata Login credentials, never",
-         " hardcoded. Register at https://urs.earthdata.nasa.gov/ if needed.")
+  earthdata_token <- Sys.getenv("EARTHDATA_TOKEN")
+  if (!nzchar(earthdata_token)) {
+    stop("EARTHDATA_TOKEN is not set. Generate a User Token at your Earthdata",
+         " profile's \"Generate Token\" page (urs.earthdata.nasa.gov -> profile",
+         " -> Generate Token) and add it to this project's .Renviron as",
+         " EARTHDATA_TOKEN=<token>, then restart your R session (Session >",
+         " Restart R) -- Sys.getenv() only picks up .Renviron changes on",
+         " session start.")
   }
-
-  cat("Logging in to AppEEARS...\n")
-  token <- appeears_login(earthdata_username, earthdata_password)
+  token <- earthdata_token
 
   task_name <- paste0("SpectralBiodiversity_MODIS_", min(years_present), "_", max(years_present))
   task_body <- build_task_body(task_name, appeears_start_date, appeears_end_date, towers_df)

@@ -4,6 +4,37 @@ Committed, dated record of work performed in this repository. Reverse
 chronological order, newest entry at the top. See CLAUDE.md for the
 convention this file follows.
 
+## 2026-09-11 20:55 UTC — ExtractMODIS.R: switch to Earthdata User Token auth, remove password login
+
+Two-step change to `Code/DataAnalysis/ExtractMODIS.R`'s auth, both in this
+session. The project's Earthdata account has MFA enabled (email +
+authenticator app); AppEEARS' `/login` endpoint does bare username+password
+Basic Auth with no way to accept a second factor, so the original
+`appeears_login()` password flow cannot work for this account at all.
+
+First pass added `EARTHDATA_TOKEN`-first, password-fallback logic (token
+checked first, `appeears_login()` password flow retained as a fallback for
+non-MFA accounts). Second pass, once a working `EARTHDATA_TOKEN` was
+confirmed generated and placed in `.Renviron`, removed the password path
+entirely per instruction (only the token method will ever be used going
+forward, and this repo prefers not carrying unused fallback code): deleted
+`appeears_login()` outright, and `run_extract_modis()` now does a single
+`Sys.getenv("EARTHDATA_TOKEN")` check with a `stop()` pointing at the
+Earthdata profile's "Generate Token" page if unset. `submit_appeears_task()`,
+`poll_appeears_task()`, `download_appeears_results()`, QC decoding, and
+`parse_appeears_csv()` untouched -- they already took a bearer `token`
+regardless of source. Header CREDENTIALS section rewritten to describe only
+the token flow, including that tokens typically expire after a few months
+(regenerate + update `.Renviron` if auth starts failing after previously
+working) and that `.Renviron` edits need an R session restart to take effect
+(`Sys.getenv()` doesn't pick up mid-session changes).
+
+Not run against the real AppEEARS API in this sandbox (no internet access,
+per the file's existing header caveat, unchanged by this edit) -- confirmed
+only that the file `parse()`s cleanly and that no orphaned
+`EARTHDATA_USERNAME`/`EARTHDATA_PASSWORD`/`appeears_login`/`req_auth_basic`
+references remain (grepped).
+
 ## 2026-08-22 21:32 UTC — AnnualSpectralDiversity.R: epsilon floor for fit_hard_wk()'s log(0) edge case
 
 Small, targeted follow-up to the gap-statistic entry directly below this
