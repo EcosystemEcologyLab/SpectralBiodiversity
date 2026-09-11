@@ -72,12 +72,40 @@ neonsites_path        <- "./Data/NEONsites.csv"
 hyperspec_dir         <- "D:/projects/moore/SpectralBiodiversity/Data/NEON_Hyperspec"
 out_csv               <- "D:/projects/moore/SpectralBiodiversity/Data/field_diversity_long.csv"
 
+# NEON DP1.10098.001 Vegetation Structure -- used only to classify species as
+# canopy-exposed vs. understory for the *_canopy metrics (Section 4b). Exact
+# filenames TBD once downloaded; these are the expected basic-package table
+# names per NEON's own convention.
+vst_apparent_path    <- "./Data/NEON_FieldData/vst_apparentindividual.csv"
+vst_mapping_path     <- "./Data/NEON_FieldData/vst_mappingandtagging.csv"
+
 flight_match_tolerance_days <- 30
 
-required_inputs <- c(div_1m2_path, div_nested_path, neonsites_path)
+# ---- CANOPY DESIGN DECISION, flagged for review (see Section 4b) ----
+# How species that never appear in vst_ at all -- vst_ only measures
+# trees/shrubs above a size threshold, so many herbs/forbs/graminoids will
+# never be in it -- are treated in the canopy-filtered metrics.
+# Default here is "include": "unmeasured" reflects a genuine data gap in
+# vst_'s sampling design (it doesn't sample below its size threshold), not
+# confirmed evidence that a species is understory/non-canopy. Defaulting to
+# exclude would silently discard a potentially large fraction of real
+# species from floristic_richness_canopy on that inference alone, rather
+# than on a measurement. "exclude" remains available as a stricter
+# alternative -- toggle and re-run rather than treating either as settled.
+unmeasured_species_treatment <- "include"  # "include" or "exclude" -- REVIEW
+
+required_inputs <- c(div_1m2_path, div_nested_path, neonsites_path,
+                      vst_apparent_path, vst_mapping_path)
 missing_inputs  <- required_inputs[!file.exists(required_inputs)]
 if (length(missing_inputs) > 0) {
-  stop("Required input(s) not found:\n  ", paste(missing_inputs, collapse = "\n  "))
+  stop("Required input(s) not found:\n  ", paste(missing_inputs, collapse = "\n  "),
+       "\n\nThe vst_ paths are NEON DP1.10098.001 (Vegetation Structure) basic-package",
+       " tables, needed for the canopy-filtered floristic_*_canopy metrics. Download",
+       " DP1.10098.001 for the relevant site(s)/year(s) and place",
+       " vst_apparentindividual.csv and vst_mappingandtagging.csv under",
+       " ./Data/NEON_FieldData/ (same convention as div_1m2Data.csv). Do not fabricate",
+       " or approximate this data -- if it is genuinely not available yet, the",
+       " canopy metrics cannot be computed.")
 }
 if (!dir.exists(hyperspec_dir)) {
   stop("Hyperspectral tile directory not found: ", hyperspec_dir)
@@ -230,6 +258,155 @@ cat("\nLoaded", nrow(div_1m2), "1m2 plantSpecies rows and", nrow(div_nested),
     "tower_ids.\n")
 
 # ============================================================================
+# 4b. Vegetation Structure (vst_) data -- canopy-exposure species
+#     classification, for the floristic_*_canopy metrics.
+#
+# Same discipline as the STEP 1 H5 investigation above: nothing below assumes
+# a column name, category value, or ID scheme without confirming it against
+# the real file first via find_one_column()/table(); anything that doesn't
+# match documented expectation stop()s with the actual structure printed,
+# rather than guessing.
+# ============================================================================
+find_one_column <- function(df, pattern, df_name) {
+  candidates <- names(df)[str_detect(names(df), regex(pattern, ignore_case = TRUE))]
+  if (length(candidates) == 0) {
+    stop("No column matching /", pattern, "/ found in ", df_name, ". Columns present: ",
+         paste(names(df), collapse = ", "),
+         ". Structure differs from what this script expects -- investigate before proceeding.")
+  }
+  if (length(candidates) > 1) {
+    stop("Multiple columns match /", pattern, "/ in ", df_name, ": ", paste(candidates, collapse = ", "),
+         ". Ambiguous -- name the correct one explicitly rather than guessing.")
+  }
+  candidates[1]
+}
+
+vst_apparent <- read.csv(vst_apparent_path, fileEncoding = "UTF-8-BOM")
+vst_mapping  <- read.csv(vst_mapping_path,  fileEncoding = "UTF-8-BOM")
+
+cat("\n==== STEP 1B: vst_ (Vegetation Structure) structure investigation ====\n")
+cat("vst_apparentindividual: ", nrow(vst_apparent), " rows, columns:\n", sep = "")
+print(names(vst_apparent))
+cat("\nSample rows:\n")
+print(head(vst_apparent, 5))
+cat("\nvst_mappingandtagging: ", nrow(vst_mapping), " rows, columns:\n", sep = "")
+print(names(vst_mapping))
+print(head(vst_mapping, 5))
+
+individual_col_apparent <- find_one_column(vst_apparent, "^individualid$", "vst_apparentindividual")
+site_col_apparent       <- find_one_column(vst_apparent, "^siteid$",       "vst_apparentindividual")
+plot_col_apparent       <- find_one_column(vst_apparent, "^plotid$",       "vst_apparentindividual")
+canopy_col              <- find_one_column(vst_apparent, "canopy.?position", "vst_apparentindividual")
+
+individual_col_mapping  <- find_one_column(vst_mapping, "^individualid$", "vst_mappingandtagging")
+taxon_col_mapping       <- find_one_column(vst_mapping, "^taxonid$",      "vst_mappingandtagging")
+
+cat("\nCanopy-position column identified as '", canopy_col, "'. Unique values:\n", sep = "")
+print(table(vst_apparent[[canopy_col]], useNA = "always"))
+
+# ---- vst_apparentindividual (repeated per-visit measurements, incl.
+# canopyPosition) carries no taxonID of its own -- species identity lives on
+# vst_mappingandtagging (assigned once per individual at tagging). Joining by
+# individualID is the documented NEON DP1.10098.001 linkage; if that
+# assumption is wrong for the real files, the join below will surface it as
+# zero matched rows rather than silently producing an empty/garbage lookup.
+vst_joined <- vst_apparent %>%
+  transmute(individualID = .data[[individual_col_apparent]],
+            siteID       = .data[[site_col_apparent]],
+            plotID       = .data[[plot_col_apparent]],
+            canopyPosition = .data[[canopy_col]]) %>%
+  inner_join(
+    vst_mapping %>% transmute(individualID = .data[[individual_col_mapping]],
+                               taxonID      = .data[[taxon_col_mapping]]),
+    by = "individualID"
+  )
+
+if (nrow(vst_joined) == 0) {
+  stop("Joining vst_apparentindividual to vst_mappingandtagging by individualID produced ",
+       "zero rows. This assumes the two tables share an individualID key per NEON ",
+       "DP1.10098.001's documented schema -- that assumption doesn't hold for these files. ",
+       "Investigate the real join key before proceeding; do not guess.")
+}
+
+cat("\nJoined vst_apparentindividual x vst_mappingandtagging by individualID:",
+    nrow(vst_joined), "of", nrow(vst_apparent), "apparentindividual rows matched.\n")
+
+# ---- exposed vs. shaded category mapping -- PROVISIONAL, based on NEON's
+# documented canopyPosition controlled vocabulary, not yet confirmed against
+# a real file (see STEP 1B printout above). If real data contains a category
+# not listed here, this stops rather than silently defaulting it to either
+# side of the exposed/shaded line -- extend the two vectors below with an
+# explicit human decision once the real categories are visible.
+exposed_categories <- c("Full sun", "Open grown", "Partially shaded")
+shaded_categories  <- c("Full shade")
+
+observed_categories <- unique(na.omit(vst_joined$canopyPosition))
+unmapped_categories <- setdiff(observed_categories, c(exposed_categories, shaded_categories))
+if (length(unmapped_categories) > 0) {
+  stop("Unmapped canopyPosition categories found in real data: ",
+       paste(unmapped_categories, collapse = ", "),
+       ". Extend exposed_categories/shaded_categories above with an explicit decision ",
+       "about which side of the exposed/shaded line each belongs on -- do not guess.")
+}
+
+# ---- STEP 3: plot-level vs. site-level linkage -- investigate the actual
+# plotID overlap rather than assuming plot-level granularity is available.
+vst_plot_ids <- unique(vst_joined$plotID)
+div_plot_ids <- unique(c(div_1m2$plotID, div_nested$plotID))
+plot_overlap <- intersect(vst_plot_ids, div_plot_ids)
+plot_overlap_frac <- if (length(vst_plot_ids) == 0) 0 else length(plot_overlap) / length(vst_plot_ids)
+
+cat("\nvst_ plotID / diversity-data plotID overlap:", length(plot_overlap), "of",
+    length(vst_plot_ids), "vst_ plots (", round(100 * plot_overlap_frac, 1), "%).\n")
+
+# Threshold is a flagged judgment call, not a NEON-documented rule: >50% of
+# vst_ plots recognized as diversity plots is treated as "linkage usable",
+# below that the schemes are assumed unrelated enough to fall back to
+# site-level pooling.
+canopy_linkage_granularity <- if (plot_overlap_frac > 0.5) "plot" else "site"
+cat("Canopy linkage granularity achieved: '", canopy_linkage_granularity, "'.\n", sep = "")
+
+# ---- STEP 2: per-species canopy-status classification, "any exposed
+# individual" rule (permissive -- flagged choice, see task note). A stricter
+# alternative (e.g. >50% of a species' measured individuals exposed, where N
+# is large enough to be meaningful) is a legitimate alternative not
+# implemented here. Computed ONCE per site, reused across every
+# bout/plot_scope/temporal_scope combo for that site (it doesn't vary by any
+# of those axes).
+build_site_canopy_lookup <- function(nsite) {
+  va_site <- vst_joined %>% filter(siteID == nsite)
+  if (nrow(va_site) == 0) return(tibble(key = character(), canopy_status = character()))
+
+  group_cols <- if (canopy_linkage_granularity == "plot") c("plotID", "taxonID") else "taxonID"
+  va_site %>%
+    mutate(is_exposed = canopyPosition %in% exposed_categories) %>%
+    group_by(across(all_of(group_cols))) %>%
+    summarise(canopy_status = if (any(is_exposed)) "exposed" else "understory", .groups = "drop") %>%
+    mutate(key = if (canopy_linkage_granularity == "plot") paste(plotID, taxonID, sep = "\r") else taxonID) %>%
+    select(key, canopy_status)
+}
+
+all_neon_sites <- unique(site_xwalk$neon_site)
+canopy_lookup_by_site <- set_names(map(all_neon_sites, build_site_canopy_lookup), all_neon_sites)
+
+exposed_statuses <- if (unmeasured_species_treatment == "include") c("exposed", "unmeasured") else "exposed"
+cat("\nUnmeasured-species treatment: '", unmeasured_species_treatment,
+    "' -- unmeasured species are ", if (unmeasured_species_treatment == "include") "INCLUDED in" else "EXCLUDED from",
+    " the canopy-filtered metrics.\n", sep = "")
+
+# taxonIDs/plotIDs must be same-length vectors from one siteID; returns
+# "exposed" / "understory" / "unmeasured" per element.
+classify_canopy_status <- function(taxonIDs, plotIDs, nsite) {
+  lookup <- canopy_lookup_by_site[[nsite]]
+  if (is.null(lookup) || nrow(lookup) == 0) return(rep("unmeasured", length(taxonIDs)))
+
+  key <- if (canopy_linkage_granularity == "plot") paste(plotIDs, taxonIDs, sep = "\r") else taxonIDs
+  status <- lookup$canopy_status[match(key, lookup$key)]
+  status[is.na(status)] <- "unmeasured"
+  status
+}
+
+# ============================================================================
 # 5. Per-(tower_id, year, plot_scope, bout) metric computation
 # ============================================================================
 compute_combo_metrics <- function(tid, yr, plot_scope, bout) {
@@ -285,6 +462,42 @@ compute_combo_metrics <- function(tid, yr, plot_scope, bout) {
     per_plot_all %>% count(plotID) %>% pull(n) %>% max()
   }
 
+  # ---- canopy-filtered metrics: same unions/matrix as above, restricted to
+  # taxa classified canopy-exposed via vst_ (Section 4b). nsite_for_canopy
+  # matches the siteID key the Section 4b lookup was built on (NEON site
+  # code, pre-crosswalk -- retained on d1/dn from the Section 4 join). ----
+  nsite_for_canopy <- if (nrow(d1) > 0) d1$siteID[1] else if (nrow(dn) > 0) dn$siteID[1] else NA_character_
+
+  if (nrow(per_plot_all) == 0 || is.na(nsite_for_canopy)) {
+    per_plot_all_canopy <- per_plot_all[0, ]
+  } else {
+    per_plot_all_canopy <- per_plot_all %>%
+      mutate(canopy_status = classify_canopy_status(taxonID, plotID, nsite_for_canopy)) %>%
+      filter(canopy_status %in% exposed_statuses) %>%
+      select(plotID, taxonID)
+  }
+
+  floristic_richness_canopy <- length(unique(per_plot_all_canopy$taxonID))
+  max_single_plot_richness_canopy <- if (nrow(per_plot_all_canopy) == 0) 0L else {
+    per_plot_all_canopy %>% count(plotID) %>% pull(n) %>% max()
+  }
+
+  if (n_plots == 0 || is.na(nsite_for_canopy)) {
+    floristic_shannon_mean_canopy  <- NA_real_
+    floristic_shannon_gamma_canopy <- NA_real_
+  } else {
+    canopy_taxa <- unique(per_plot_all_canopy$taxonID)
+    canopy_cols <- intersect(colnames(comm), canopy_taxa)
+    if (length(canopy_cols) == 0) {
+      floristic_shannon_mean_canopy  <- NA_real_
+      floristic_shannon_gamma_canopy <- NA_real_
+    } else {
+      comm_canopy <- comm[, canopy_cols, drop = FALSE]
+      floristic_shannon_mean_canopy  <- mean(hill_taxa(comm_canopy, q = 1))
+      floristic_shannon_gamma_canopy <- hill_taxa_parti(comm_canopy, q = 1, show_warning = FALSE)$TD_gamma
+    }
+  }
+
   # ---- bout end date, for peak_flight matching ----
   end_dates <- if (nrow(d1) > 0) d1$endDate else dn$endDate
   bout_end_date <- if (length(end_dates) == 0) as.Date(NA) else median(end_dates, na.rm = TRUE)
@@ -294,6 +507,10 @@ compute_combo_metrics <- function(tid, yr, plot_scope, bout) {
        floristic_shannon_gamma = floristic_shannon_gamma,
        floristic_richness = floristic_richness,
        max_single_plot_richness = max_single_plot_richness,
+       floristic_shannon_mean_canopy = floristic_shannon_mean_canopy,
+       floristic_shannon_gamma_canopy = floristic_shannon_gamma_canopy,
+       floristic_richness_canopy = floristic_richness_canopy,
+       max_single_plot_richness_canopy = max_single_plot_richness_canopy,
        bout_end_date = bout_end_date,
        d1 = d1, dn = dn)
 }
@@ -329,7 +546,9 @@ for (i in seq_len(nrow(grid))) {
       temporal_scope = NA_character_, bout = NA_integer_, n_plots = NA_integer_,
       flight_date_matched = as.Date(NA), bout_end_date = as.Date(NA),
       floristic_shannon_mean = NA_real_, floristic_shannon_gamma = NA_real_,
-      floristic_richness = NA_integer_, status = "no data")
+      floristic_richness = NA_integer_,
+      floristic_shannon_mean_canopy = NA_real_, floristic_shannon_gamma_canopy = NA_real_,
+      floristic_richness_canopy = NA_integer_, status = "no data")
     next
   }
 
@@ -340,7 +559,10 @@ for (i in seq_len(nrow(grid))) {
            flight_date_matched = as.Date(NA), bout_end_date = m$bout_end_date,
            floristic_shannon_mean = m$floristic_shannon_mean,
            floristic_shannon_gamma = m$floristic_shannon_gamma,
-           floristic_richness = m$floristic_richness, status = "ok")
+           floristic_richness = m$floristic_richness,
+           floristic_shannon_mean_canopy = m$floristic_shannon_mean_canopy,
+           floristic_shannon_gamma_canopy = m$floristic_shannon_gamma_canopy,
+           floristic_richness_canopy = m$floristic_richness_canopy, status = "ok")
   }) %>% bind_rows()
 
   result_rows[[length(result_rows) + 1]] <- bout_rows
@@ -369,7 +591,9 @@ for (i in seq_len(nrow(grid))) {
 field_diversity_long <- bind_rows(result_rows) %>%
   select(tower_id, neon_site, year, plot_scope, temporal_scope, bout, n_plots,
          flight_date_matched, bout_end_date, floristic_shannon_mean,
-         floristic_shannon_gamma, floristic_richness, status)
+         floristic_shannon_gamma, floristic_richness,
+         floristic_shannon_mean_canopy, floristic_shannon_gamma_canopy,
+         floristic_richness_canopy, status)
 
 dir.create(dirname(out_csv), recursive = TRUE, showWarnings = FALSE)
 write.csv(field_diversity_long, out_csv, row.names = FALSE)
@@ -429,10 +653,19 @@ if (nrow(spot_check_key) == 0) {
         " floristic_shannon_gamma:", m$floristic_shannon_gamma,
         " floristic_richness:", m$floristic_richness,
         " max_single_plot_richness:", m$max_single_plot_richness, "\n")
+    cat("floristic_shannon_mean_canopy:", m$floristic_shannon_mean_canopy,
+        " floristic_shannon_gamma_canopy:", m$floristic_shannon_gamma_canopy,
+        " floristic_richness_canopy:", m$floristic_richness_canopy,
+        " max_single_plot_richness_canopy:", m$max_single_plot_richness_canopy, "\n")
     if (m$floristic_richness < m$max_single_plot_richness) {
       cat("  !! SANITY FLOOR VIOLATED: gamma richness below a single plot's richness.\n")
     } else {
       cat("  OK: floristic_richness >= max_single_plot_richness (sanity floor holds).\n")
+    }
+    if (m$floristic_richness_canopy < m$max_single_plot_richness_canopy) {
+      cat("  !! SANITY FLOOR VIOLATED (canopy): gamma richness below a single plot's richness.\n")
+    } else {
+      cat("  OK: floristic_richness_canopy >= max_single_plot_richness_canopy (sanity floor holds).\n")
     }
   }
 
@@ -455,6 +688,12 @@ for (i in seq_len(nrow(computed_rows))) {
     violations <- violations + 1
     cat("  !! VIOLATION:", r$tower_id, r$year, r$plot_scope, r$temporal_scope, "bout", r$bout,
         "-- richness", r$floristic_richness, "< max single-plot richness", m$max_single_plot_richness, "\n")
+  }
+  if (r$floristic_richness_canopy < m$max_single_plot_richness_canopy) {
+    violations <- violations + 1
+    cat("  !! VIOLATION (canopy):", r$tower_id, r$year, r$plot_scope, r$temporal_scope, "bout", r$bout,
+        "-- richness_canopy", r$floristic_richness_canopy, "< max single-plot richness_canopy",
+        m$max_single_plot_richness_canopy, "\n")
   }
 }
 cat(if (violations == 0) "All rows pass the sanity floor.\n" else paste(violations, "violation(s) found -- see above.\n"))

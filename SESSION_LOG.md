@@ -4,6 +4,62 @@ Committed, dated record of work performed in this repository. Reverse
 chronological order, newest entry at the top. See CLAUDE.md for the
 convention this file follows.
 
+## 2026-09-11 23:51 UTC — FieldDiversity.R: add canopy-filtered floristic metrics via NEON vst_ (Vegetation Structure) data
+
+Added a parallel, additive set of metrics -- `floristic_richness_canopy`,
+`floristic_shannon_mean_canopy`, `floristic_shannon_gamma_canopy` -- to
+`Code/DataAnalysis/FieldDiversity.R`, restricted to species classified as
+canopy-exposed, so the field diversity comparison isn't crediting the
+hyperspectral pipeline with understory species an aerial sensor could never
+see. Classification comes from NEON's DP1.10098.001 Vegetation Structure
+product (`vst_apparentindividual` joined to `vst_mappingandtagging` by
+`individualID`, since taxonID lives on the mapping table, not
+apparentindividual).
+
+New "Section 4b" mirrors the existing STEP 1 H5-investigation discipline: no
+vst_ column name, category value, or table name is hardcoded without a
+runtime check first -- `find_one_column()` regex-locates
+`individualID`/`siteID`/`plotID`/`canopyPosition`-like columns and `stop()`s
+listing real columns on zero/multiple matches; the apparentindividual x
+mappingandtagging join `stop()`s on zero rows rather than proceeding on a
+wrong assumed key; any canopyPosition category outside the provisional
+`exposed_categories`/`shaded_categories` vectors (`"Full sun"`,
+`"Open grown"`, `"Partially shaded"` vs. `"Full shade"` -- NEON's documented
+vocabulary, not yet confirmed against a real file) `stop()`s rather than
+guessing which side of the line it falls on.
+
+vst_ data does not exist in this sandbox (no `Data/` directory at all, this
+sandbox never has real data) -- added `vst_apparent_path`/`vst_mapping_path`
+to the script's existing `required_inputs` check, so it `stop()`s immediately
+naming both expected files and DP1.10098.001. Confirmed the script still
+`parse()`s cleanly; could not run it end-to-end (also missing the `hillR`
+package in this sandbox, pre-existing, unrelated to this change).
+
+Two flagged design decisions, both implemented as explicit config rather than
+silent defaults:
+- Per-species canopy-exposure rule: permissive "any exposed individual"
+  (a species counts as exposed at a site if ANY measured individual there
+  has an exposed canopyPosition) -- a stricter >50%-of-individuals rule is
+  noted as a legitimate future alternative, not implemented.
+- `unmeasured_species_treatment` (species that never appear in vst_ at all,
+  most likely herbs/forbs/graminoids below vst_'s size threshold): initially
+  defaulted to `"exclude"`, then changed to `"include"` in a same-day
+  follow-up -- `"unmeasured"` reflects a genuine vst_ sampling-design gap,
+  not confirmed evidence of non-canopy status, so defaulting to exclude
+  risked silently discarding real species from `floristic_richness_canopy`
+  on an inference rather than a measurement. `"exclude"` remains available
+  as the stricter alternative.
+
+Plot-vs-site linkage granularity is also investigated at runtime (vst_'s
+`plotID` overlap with the diversity data's `plotID`s, falling back to
+site-level pooling below a 50% overlap threshold -- my own judgment call,
+flagged in-code, not a NEON-documented rule) rather than assumed. All three
+new columns were threaded through `compute_combo_metrics()`'s return list,
+both grid-loop tibble-construction sites, and the final `select()`, alongside
+the three existing metrics (nothing existing renamed, removed, or
+reordered). The existing gamma-richness-floor sanity check was extended with
+an equivalent check for `floristic_richness_canopy`.
+
 ## 2026-09-11 20:55 UTC — ExtractMODIS.R: switch to Earthdata User Token auth, remove password login
 
 Two-step change to `Code/DataAnalysis/ExtractMODIS.R`'s auth, both in this
