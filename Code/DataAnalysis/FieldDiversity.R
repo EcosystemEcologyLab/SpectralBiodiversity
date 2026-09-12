@@ -80,6 +80,12 @@ out_csv               <- "D:/projects/moore/SpectralBiodiversity/Data/field_dive
 vst_apparent_path    <- "./Data/NEON_FieldData/vst_apparentindividual.csv"
 vst_mapping_path     <- "./Data/NEON_FieldData/vst_mappingandtagging.csv"
 
+# Herbaceous/non-woody companion table -- vst_apparentindividual only covers
+# trees/shrubs, so without this the *_canopy metrics can only ever exclude
+# confirmed-shaded woody species, never understory herbs/forbs/graminoids
+# (see Section 4c). Structure unconfirmed -- investigated at runtime there.
+vst_nonwoody_path    <- "./Data/NEON_FieldData/vst_non-woody.csv"
+
 flight_match_tolerance_days <- 30
 
 # ---- CANOPY DESIGN DECISION, flagged for review (see Section 4b) ----
@@ -96,7 +102,7 @@ flight_match_tolerance_days <- 30
 unmeasured_species_treatment <- "include"  # "include" or "exclude" -- REVIEW
 
 required_inputs <- c(div_1m2_path, div_nested_path, neonsites_path,
-                      vst_apparent_path, vst_mapping_path)
+                      vst_apparent_path, vst_mapping_path, vst_nonwoody_path)
 missing_inputs  <- required_inputs[!file.exists(required_inputs)]
 if (length(missing_inputs) > 0) {
   stop("Required input(s) not found:\n  ", paste(missing_inputs, collapse = "\n  "),
@@ -282,6 +288,16 @@ find_one_column <- function(df, pattern, df_name) {
   candidates[1]
 }
 
+# Like find_one_column(), but for exploratory checks where the column
+# genuinely may not exist -- returns NA instead of stop()ing on zero or
+# multiple matches, so a candidate-field search can report "not found"
+# rather than aborting the script.
+find_optional_column <- function(df, pattern) {
+  candidates <- names(df)[str_detect(names(df), regex(pattern, ignore_case = TRUE))]
+  if (length(candidates) != 1) return(NA_character_)
+  candidates
+}
+
 vst_apparent <- read.csv(vst_apparent_path, fileEncoding = "UTF-8-BOM")
 
 # ---- vst_mappingandtagging.csv: a real run found base read.csv() silently
@@ -361,9 +377,93 @@ canopy_col              <- find_one_column(vst_apparent, "canopy.?position", "vs
 
 individual_col_mapping  <- find_one_column(vst_mapping, "^individualid$", "vst_mappingandtagging")
 taxon_col_mapping       <- find_one_column(vst_mapping, "^taxonid$",      "vst_mappingandtagging")
+date_col_apparent       <- find_one_column(vst_apparent, "^date$", "vst_apparentindividual")
+date_col_mapping        <- find_one_column(vst_mapping,  "^date$", "vst_mappingandtagging")
 
 cat("\nCanopy-position column identified as '", canopy_col, "'. Unique values:\n", sep = "")
 print(table(vst_apparent[[canopy_col]], useNA = "always"))
+
+# ---- Duplicate individualID investigation, BEFORE joining. A real run
+# found the join fanning out: 502,012 apparentindividual rows joined
+# against 158,898 mapping rows produced 505,124 matched rows (MORE than the
+# apparentindividual side alone), with dplyr's own "unexpected many-to-many
+# relationship" warning. Investigated rather than assumed which side is
+# actually non-unique.
+#
+# vst_apparentindividual: the SAME individualID appearing across multiple
+# rows (different visit dates) is EXPECTED, not a defect -- every visit's
+# canopyPosition is independent evidence and must be preserved, not
+# deduplicated. The real anomaly to check for is a duplicate
+# (individualID, date) PAIR -- the same individual measured twice on the
+# same visit.
+apparent_dupe_visits <- vst_apparent %>%
+  count(.data[[individual_col_apparent]], .data[[date_col_apparent]]) %>%
+  filter(n > 1)
+cat("\nvst_apparentindividual:", n_distinct(vst_apparent[[individual_col_apparent]]),
+    "distinct individualIDs across", nrow(vst_apparent), "rows (repeat-visit structure is",
+    "expected and NOT deduplicated). Duplicate (individualID, date) pairs -- a genuine",
+    "anomaly, distinct from expected repeat-visit structure:", nrow(apparent_dupe_visits), "\n")
+if (nrow(apparent_dupe_visits) > 0) {
+  cat("Sample duplicate (individualID, date) pairs in vst_apparentindividual:\n")
+  print(head(apparent_dupe_visits, 10))
+}
+
+# vst_mappingandtagging: SHOULD be one static identity row per individualID
+# (assigned once at tagging) -- any individualID appearing more than once
+# here is the real candidate source of the join fan-out.
+mapping_dupe_counts <- vst_mapping %>% count(.data[[individual_col_mapping]]) %>% filter(n > 1)
+mapping_dupe_ids <- mapping_dupe_counts[[individual_col_mapping]]
+
+cat("\nvst_mappingandtagging:", length(mapping_dupe_ids), "of",
+    n_distinct(vst_mapping[[individual_col_mapping]]),
+    "distinct individualIDs have MORE THAN ONE row (", nrow(vst_mapping), "total rows).\n")
+
+if (length(mapping_dupe_ids) > 0) {
+  cat("Full rows for the first few duplicated individualIDs (inspect the actual pattern",
+      "before deduplicating):\n")
+  print(vst_mapping %>% filter(.data[[individual_col_mapping]] %in% head(mapping_dupe_ids, 5)) %>%
+          arrange(.data[[individual_col_mapping]]))
+
+  # ---- Mandatory check: do any duplicate individualID groups disagree on
+  # taxonID? If so this is a genuine identity conflict, not benign
+  # re-tagging/re-mapping history, and must not be resolved by picking a
+  # row automatically -- stop() and surface it for a human decision, per
+  # this project's established discipline.
+  taxon_conflicts <- vst_mapping %>%
+    filter(.data[[individual_col_mapping]] %in% mapping_dupe_ids) %>%
+    group_by(.data[[individual_col_mapping]]) %>%
+    summarise(n_taxa = n_distinct(.data[[taxon_col_mapping]]), .groups = "drop") %>%
+    filter(n_taxa > 1)
+
+  if (nrow(taxon_conflicts) > 0) {
+    conflict_ids <- taxon_conflicts[[individual_col_mapping]]
+    cat("\n!! taxonID CONFLICTS found within duplicate individualID groups:\n")
+    print(vst_mapping %>% filter(.data[[individual_col_mapping]] %in% conflict_ids) %>%
+            arrange(.data[[individual_col_mapping]]))
+    stop(length(conflict_ids), " individualID(s) in vst_mappingandtagging are associated with ",
+         "MORE THAN ONE distinct taxonID across their duplicate rows (printed above) -- this is ",
+         "a genuine identity conflict, not benign re-tagging history, and cannot be resolved by ",
+         "picking a row automatically. Investigate these specific individualIDs and decide how ",
+         "to resolve them before deduplicating; do not guess.")
+  }
+  cat("\nNo taxonID conflicts found within duplicate individualID groups -- duplicates appear to",
+      "be benign re-tagging/re-mapping history (same species, multiple dated records). Safe to",
+      "deduplicate by keeping the most recent record per individualID.\n")
+}
+
+# ---- Deduplicate vst_mappingandtagging to one row per individualID,
+# keeping the most recent `date` as the tiebreaker -- applied BEFORE the
+# join, not as a post-hoc filter on already-fanned-out rows.
+# vst_apparentindividual is NOT deduplicated (its repeat-visit rows are
+# legitimate, independent canopyPosition evidence, confirmed above).
+vst_mapping_deduped <- vst_mapping %>%
+  mutate(.dedupe_date = suppressWarnings(as.Date(.data[[date_col_mapping]]))) %>%
+  arrange(.data[[individual_col_mapping]], desc(.dedupe_date)) %>%
+  distinct(across(all_of(individual_col_mapping)), .keep_all = TRUE) %>%
+  select(-.dedupe_date)
+
+cat("\nDeduplicated vst_mappingandtagging:", nrow(vst_mapping), "->", nrow(vst_mapping_deduped),
+    "rows (one per individualID).\n")
 
 # ---- vst_apparentindividual (repeated per-visit measurements, incl.
 # canopyPosition) carries no taxonID of its own -- species identity lives on
@@ -371,15 +471,22 @@ print(table(vst_apparent[[canopy_col]], useNA = "always"))
 # individualID is the documented NEON DP1.10098.001 linkage; if that
 # assumption is wrong for the real files, the join below will surface it as
 # zero matched rows rather than silently producing an empty/garbage lookup.
+# relationship = "many-to-one" makes the expected cardinality explicit --
+# vst_apparentindividual is legitimately many rows per individualID (visit
+# history), vst_mappingandtagging is now exactly one per individualID after
+# deduplication -- so any future regression in that uniqueness (e.g. a
+# re-download reintroducing duplicates) fails loudly here instead of
+# silently fanning out again.
 vst_joined <- vst_apparent %>%
   transmute(individualID = .data[[individual_col_apparent]],
             siteID       = .data[[site_col_apparent]],
             plotID       = .data[[plot_col_apparent]],
             canopyPosition = .data[[canopy_col]]) %>%
   inner_join(
-    vst_mapping %>% transmute(individualID = .data[[individual_col_mapping]],
-                               taxonID      = .data[[taxon_col_mapping]]),
-    by = "individualID"
+    vst_mapping_deduped %>% transmute(individualID = .data[[individual_col_mapping]],
+                                       taxonID      = .data[[taxon_col_mapping]]),
+    by = "individualID",
+    relationship = "many-to-one"
   )
 
 if (nrow(vst_joined) == 0) {
@@ -387,6 +494,16 @@ if (nrow(vst_joined) == 0) {
        "zero rows. This assumes the two tables share an individualID key per NEON ",
        "DP1.10098.001's documented schema -- that assumption doesn't hold for these files. ",
        "Investigate the real join key before proceeding; do not guess.")
+}
+
+# Belt-and-suspenders check alongside dplyr's own relationship = "many-to-one"
+# guard: the join must never produce more rows than went in on the "many"
+# side once the "one" side is genuinely unique.
+if (nrow(vst_joined) > nrow(vst_apparent)) {
+  stop("Join still fans out after deduplication: ", nrow(vst_joined), " matched rows exceeds ",
+       "the ", nrow(vst_apparent), " vst_apparentindividual rows going in. relationship = ",
+       "\"many-to-one\" should have caught this as an error -- investigate further before ",
+       "trusting downstream canopy classification.")
 }
 
 join_match_rate <- nrow(vst_joined) / nrow(vst_apparent)
@@ -404,20 +521,39 @@ if (join_match_rate < 0.5) {
 
 # ---- Attempt to confirm exposed/shaded placement against NEON's
 # authoritative categoricalCodes_10098.csv definitions, rather than the
-# label text alone. Best-effort: a missing file or unexpected column layout
-# falls back to the documented judgment call below rather than blocking the
-# whole script on a reference-table lookup.
+# label text alone. A real run confirmed this file's actual column
+# structure is name/pubCode/description/startDate/endDate -- NOT the
+# fieldName/name/definition layout originally guessed here, which meant
+# the lookup below could never have matched anything on the first attempt.
+# Corrected to filter on `name` directly (the category label itself, e.g.
+# "Mostly shaded") against the known canopyPosition vocabulary, since this
+# structure has no fieldName column to scope the search to one field first.
+# categorical_codes/cc_name_col/cc_desc_col are kept in scope for reuse by
+# the vst_non-woody section (4c) below, so its own exposure-proxy field (if
+# any) can be looked up the same way. Still best-effort: a missing file or
+# unexpected layout falls back to the documented judgment call below rather
+# than blocking the whole script on a reference-table lookup.
 categorical_codes_path <- "./Data/NEON_FieldData/categoricalCodes_10098.csv"
+canopy_categories_of_interest <- c("Full shade", "Mostly shaded", "Partially shaded",
+                                    "Open grown", "Full sun")
+categorical_codes <- NULL
+cc_name_col <- NA_character_
+cc_desc_col <- NA_character_
+
 if (file.exists(categorical_codes_path)) {
   categorical_codes <- read.csv(categorical_codes_path, fileEncoding = "UTF-8-BOM")
-  cc_field_col <- tryCatch(find_one_column(categorical_codes, "^fieldname$", "categoricalCodes_10098"), error = function(e) NA)
-  cc_name_col  <- tryCatch(find_one_column(categorical_codes, "^name$", "categoricalCodes_10098"), error = function(e) NA)
-  cc_def_col   <- tryCatch(find_one_column(categorical_codes, "definition", "categoricalCodes_10098"), error = function(e) NA)
-  if (!is.na(cc_field_col) && !is.na(cc_name_col) && !is.na(cc_def_col)) {
+  cc_name_col <- find_optional_column(categorical_codes, "^name$")
+  cc_desc_col <- find_optional_column(categorical_codes, "^description$")
+  cc_pub_col  <- find_optional_column(categorical_codes, "^pubcode$")
+
+  if (!is.na(cc_name_col) && !is.na(cc_desc_col)) {
     canopy_position_definitions <- categorical_codes %>%
-      filter(.data[[cc_field_col]] == "canopyPosition") %>%
-      transmute(category = .data[[cc_name_col]], definition = .data[[cc_def_col]])
-    cat("\n==== categoricalCodes_10098.csv: canopyPosition definitions ====\n")
+      filter(.data[[cc_name_col]] %in% canopy_categories_of_interest) %>%
+      transmute(category = .data[[cc_name_col]],
+                pubCode = if (!is.na(cc_pub_col)) .data[[cc_pub_col]] else NA,
+                definition = .data[[cc_desc_col]])
+    cat("\n==== categoricalCodes_10098.csv: canopyPosition definitions",
+        "(matched by category label against the known vocabulary) ====\n")
     if (nrow(canopy_position_definitions) > 0) {
       print(as.data.frame(canopy_position_definitions))
       cat("REVIEW the definitions printed above against the exposed_categories/",
@@ -427,13 +563,13 @@ if (file.exists(categorical_codes_path)) {
           "vectors below if the printed definitions disagree with any of the five",
           "placements.\n")
     } else {
-      cat("(no rows with fieldName == \"canopyPosition\" found -- this file may use a",
-          "different field-name spelling, or doesn't cover this field. Falling back to",
-          "the ordinal judgment call below.)\n")
+      cat("(no rows matched any known canopyPosition category label -- this file may not",
+          "cover this field, or use different label text. Falling back to the ordinal",
+          "judgment call below.)\n")
     }
   } else {
-    cat("\ncategoricalCodes_10098.csv exists but doesn't have the expected fieldName/name/",
-        "definition columns (found:", paste(names(categorical_codes), collapse = ", "),
+    cat("\ncategoricalCodes_10098.csv exists but doesn't have the expected name/description",
+        "columns (found:", paste(names(categorical_codes), collapse = ", "),
         ") -- cannot confirm category definitions against it programmatically here;",
         "inspect it by hand if the judgment call below needs revisiting.\n")
   }
@@ -476,6 +612,138 @@ if (length(unmapped_categories) > 0) {
        paste(unmapped_categories, collapse = ", "),
        ". Extend exposed_categories/shaded_categories above with an explicit decision ",
        "about which side of the exposed/shaded line each belongs on -- do not guess.")
+}
+
+# ============================================================================
+# 4c. vst_non-woody -- investigate for a usable canopy/light-exposure proxy
+# to extend the *_canopy metrics beyond woody species. vst_apparentindividual
+# only covers trees/shrubs, so without this the canopy filter can only ever
+# exclude confirmed-shaded TREES, never understory herbs/forbs/graminoids --
+# a real motivating case for this whole addition. Nothing below assumes this
+# table's structure, columns, or category vocabulary; everything is
+# investigated live and printed before any integration decision is made. If
+# no usable field is found, this section reports that clearly and leaves
+# vst_joined (and therefore the classification below) untouched -- it does
+# NOT fabricate an exposure signal from an unrelated field (cover, height,
+# growth form) just to close the coverage gap.
+# ============================================================================
+vst_nonwoody <- read.csv(vst_nonwoody_path, fileEncoding = "UTF-8-BOM")
+
+cat("\n==== STEP 1C: vst_non-woody structure investigation ====\n")
+cat("vst_non-woody: ", nrow(vst_nonwoody), " rows, columns:\n", sep = "")
+print(names(vst_nonwoody))
+cat("\nSample rows:\n")
+print(head(vst_nonwoody, 5))
+
+nonwoody_taxon_col  <- find_optional_column(vst_nonwoody, "^taxonid$")
+nonwoody_site_col   <- find_optional_column(vst_nonwoody, "^siteid$")
+nonwoody_plot_col   <- find_optional_column(vst_nonwoody, "^plotid$")
+nonwoody_canopy_col <- find_optional_column(vst_nonwoody, "canopy.?position")
+nonwoody_other_candidates <- setdiff(
+  names(vst_nonwoody)[str_detect(names(vst_nonwoody),
+    regex("cover|height|growthform|light|exposure|shade|sun", ignore_case = TRUE))],
+  na.omit(nonwoody_canopy_col)
+)
+
+cat("\nvst_non-woody carries taxonID directly: ", !is.na(nonwoody_taxon_col),
+    "; siteID directly: ", !is.na(nonwoody_site_col),
+    "; plotID directly: ", !is.na(nonwoody_plot_col), ".\n", sep = "")
+cat(if (!is.na(nonwoody_taxon_col)) {
+  "No separate identity-mapping join needed -- taxonID is carried directly per row (non-woody\nsurveys apparently don't tag/map individual plants the way vst_apparentindividual does).\n"
+} else {
+  "No direct taxonID column found -- this table would need an identity-mapping join (mirroring\nvst_apparentindividual x vst_mappingandtagging) before species could be classified from it;\nnot attempted since no direct taxonID path was found.\n"
+})
+
+cat("canopyPosition-analogous field found in vst_non-woody: ",
+    ifelse(is.na(nonwoody_canopy_col), "NONE", nonwoody_canopy_col), "\n", sep = "")
+if (length(nonwoody_other_candidates) > 0) {
+  cat("Other candidate exposure-proxy-ish column(s) present (NOT integrated automatically --",
+      "converting cover/height/growth-form into exposed/shaded evidence would require a new,",
+      "undiscussed thresholding rule this script does not fabricate):",
+      paste(nonwoody_other_candidates, collapse = ", "), "\n")
+}
+
+nonwoody_usable <- !is.na(nonwoody_canopy_col) && !is.na(nonwoody_taxon_col) &&
+                   !is.na(nonwoody_site_col) && !is.na(nonwoody_plot_col)
+
+if (nonwoody_usable) {
+  cat("\nvst_non-woody has a usable canopyPosition-analogous field ('", nonwoody_canopy_col,
+      "') with direct taxonID/siteID/plotID -- integrating into the unified canopy-evidence",
+      " table below. Unique values:\n", sep = "")
+  print(table(vst_nonwoody[[nonwoody_canopy_col]], useNA = "always"))
+
+  # Re-check categoricalCodes_10098.csv for THIS field's real categories,
+  # reusing the categorical_codes/cc_name_col/cc_desc_col objects already
+  # loaded above (same confirmed name/description structure).
+  nonwoody_observed_categories <- unique(na.omit(vst_nonwoody[[nonwoody_canopy_col]]))
+  if (!is.null(categorical_codes) && !is.na(cc_name_col) && !is.na(cc_desc_col)) {
+    nonwoody_definitions <- categorical_codes %>%
+      filter(.data[[cc_name_col]] %in% nonwoody_observed_categories) %>%
+      transmute(category = .data[[cc_name_col]], definition = .data[[cc_desc_col]])
+    cat("\n==== categoricalCodes_10098.csv: vst_non-woody '", nonwoody_canopy_col,
+        "' definitions ====\n", sep = "")
+    if (nrow(nonwoody_definitions) > 0) {
+      print(as.data.frame(nonwoody_definitions))
+      cat("CONFIRMED against categoricalCodes_10098.csv -- not a judgment call, unlike the",
+          "original canopyPosition placements above.\n")
+    } else {
+      cat("(no matching definitions found -- category placement below, if any, is a judgment",
+          "call, not a confirmed definition.)\n")
+    }
+  } else {
+    cat("\ncategoricalCodes_10098.csv unavailable/unusable -- category placement below, if any,",
+        "is a judgment call, not a confirmed definition.\n")
+  }
+
+  # This field reuses the SAME exposed_categories/shaded_categories vocabulary
+  # already established for woody canopyPosition -- only valid because NEON's
+  # canopyPosition vocabulary is shared vocabulary, not because non-woody
+  # categories are assumed to match without checking. Any category found here
+  # that isn't already in one of those two vectors stops rather than guesses.
+  nonwoody_unmapped <- setdiff(nonwoody_observed_categories, c(exposed_categories, shaded_categories))
+  if (length(nonwoody_unmapped) > 0) {
+    stop("vst_non-woody's '", nonwoody_canopy_col, "' field contains categories not covered by ",
+         "exposed_categories/shaded_categories: ", paste(nonwoody_unmapped, collapse = ", "),
+         ". Extend those vectors (informed by the categoricalCodes_10098.csv definitions ",
+         "printed above, if found) before proceeding -- do not guess.")
+  }
+
+  nonwoody_evidence <- vst_nonwoody %>%
+    transmute(individualID   = NA_character_,
+              siteID         = .data[[nonwoody_site_col]],
+              plotID         = .data[[nonwoody_plot_col]],
+              taxonID        = .data[[nonwoody_taxon_col]],
+              canopyPosition = .data[[nonwoody_canopy_col]])
+
+  vst_joined <- vst_joined %>% mutate(source = "vst_apparentindividual") %>%
+    bind_rows(nonwoody_evidence %>% mutate(source = "vst_non-woody"))
+
+  cat("\nCombined canopy-evidence table:", sum(vst_joined$source == "vst_apparentindividual"),
+      "woody rows +", sum(vst_joined$source == "vst_non-woody"), "non-woody rows =",
+      nrow(vst_joined), "total.\n")
+
+  # ---- Flag species with evidence from BOTH sources -- not silently
+  # resolved. build_site_canopy_lookup() below already pools ALL rows for a
+  # taxonID (regardless of source) before voting exposed/understory/
+  # unmeasured, so "exposed wins if either source shows it" falls out of
+  # the existing any-exposed-individual rule with no extra code needed;
+  # this just reports how often it actually matters.
+  both_source_taxa <- vst_joined %>%
+    filter(!is.na(taxonID)) %>%
+    group_by(taxonID) %>%
+    summarise(n_sources = n_distinct(source), .groups = "drop") %>%
+    filter(n_sources > 1)
+  cat(nrow(both_source_taxa), "taxonID(s) have canopy evidence from BOTH vst_apparentindividual",
+      "and vst_non-woody -- resolved by the existing any-exposed-individual rule (exposed wins",
+      "if either source shows it for that species), not a separate cross-source resolution",
+      "step.\n")
+} else {
+  cat("\nvst_non-woody does NOT have a usable canopyPosition-analogous field together with the",
+      "taxonID/siteID/plotID needed to integrate it automatically -- the herb/forb/graminoid",
+      "canopy-filter coverage gap REMAINS OPEN. Not fabricating an exposure signal from an",
+      "unrelated field (cover/height/growth form) per explicit instruction; vst_joined is left",
+      "unchanged (woody evidence only). A different approach would be needed to close this gap",
+      "for non-woody species.\n")
 }
 
 # ---- STEP 3: plot-level vs. site-level linkage -- investigate the actual

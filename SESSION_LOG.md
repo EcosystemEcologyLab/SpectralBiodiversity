@@ -4,6 +4,56 @@ Committed, dated record of work performed in this repository. Reverse
 chronological order, newest entry at the top. See CLAUDE.md for the
 convention this file follows.
 
+## 2026-09-12 01:32 UTC — FieldDiversity.R: fix join fan-out, correct categoricalCodes lookup, extend canopy classification to vst_non-woody
+
+Two more issues surfaced by a real run, plus the extension originally
+scoped for a later pass:
+
+(1) The `vst_apparentindividual` x `vst_mappingandtagging` join fanned out
+(502,012 rows in -> 505,124 matched out) with dplyr's "unexpected
+many-to-many relationship" warning. Investigated both sides before fixing:
+`vst_apparentindividual`'s repeat individualIDs across visit-dates are
+expected (preserved, not deduplicated) and checked for the separate genuine
+anomaly of a duplicate (individualID, date) pair; `vst_mappingandtagging`
+duplicates are the real fan-out source (should be one static identity row
+per individualID). Added a mandatory taxonID-conflict check across
+duplicate groups -- `stop()`s with the conflicting rows printed rather than
+resolving automatically if any exist -- then deduplicates
+`vst_mappingandtagging` (keep most recent `date` per individualID) before
+the join. `inner_join()` now declares `relationship = "many-to-one"`
+explicitly, plus a manual `nrow(vst_joined) > nrow(vst_apparent)` assertion,
+so a future regression in that uniqueness fails loudly instead of silently
+fanning out again.
+
+(2) Corrected the `categoricalCodes_10098.csv` lookup added two entries
+ago: it was filtering on a `fieldName` column that doesn't actually exist
+in this file's real structure (`name`/`pubCode`/`description`/`startDate`/
+`endDate`), so it could never have matched anything. Now matches by
+category label (`name`) directly against the known canopyPosition
+vocabulary; the loaded object is kept in scope for reuse.
+
+(3) Added Section 4c: investigates `vst_non-woody.csv` (not yet used
+anywhere in this script) for a canopyPosition-analogous field, since
+`vst_apparentindividual` only covers woody trees/shrubs -- meaning the
+canopy filter could previously only ever exclude confirmed-shaded TREES,
+never understory herbs/forbs/graminoids, a real motivating case for this
+whole addition. If a usable field plus direct taxonID/siteID/plotID are
+found, its rows are folded straight into `vst_joined` before
+`build_site_canopy_lookup()` runs, re-using the corrected
+categoricalCodes_10098.csv lookup for its category definitions and the
+same `exposed_categories`/`shaded_categories` vocabulary -- no changes
+needed to the classification function itself, since it already pools all
+evidence for a taxonID regardless of source (so "exposed wins if either
+source shows it" falls out for free). If no usable field exists, reports
+that clearly and leaves the woody-only evidence untouched rather than
+fabricating an exposure signal from cover/height/growth-form data.
+
+Confirmed the script still `parse()`s cleanly. None of this could be run
+against real data -- no NEON files exist in this sandbox; all three fixes
+are instrumented to self-report their actual effect (row counts, match
+rates, confirmed-vs-judgment-call definitions, cross-source taxon overlap)
+on the next real run rather than claimed as verified here.
+
 ## 2026-09-12 00:59 UTC — FieldDiversity.R: NA canopyPosition no longer treated as shading evidence
 
 Follow-up to the NA-canopyPosition diagnostic added in the prior entry
