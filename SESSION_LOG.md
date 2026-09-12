@@ -4,6 +4,35 @@ Committed, dated record of work performed in this repository. Reverse
 chronological order, newest entry at the top. See CLAUDE.md for the
 convention this file follows.
 
+## 2026-09-12 00:04 UTC — Add NEON_Download_VegStructure.R: DP1.10098.001 download script for FieldDiversity.R's canopy metrics
+
+New `Code/DataDownload/NEON_Download_VegStructure.R`, downloading NEON
+Vegetation Structure (DP1.10098.001) via `neonUtilities::loadByProduct()` to
+supply the two inputs FieldDiversity.R's canopy-filtering addition expects
+(`./Data/NEON_FieldData/vst_apparentindividual.csv` and
+`vst_mappingandtagging.csv`). Found and mirrored the existing analogous
+download script, `NEON_Download_FieldVeg.R` (DP1.10058.001, the `div_`
+files) -- same `loadByProduct()`-then-write-every-returned-table structure,
+same `NEON_API_TOKEN`-optional/`.Renviron` convention, same output
+directory. That script itself downloads `site = "all"` with no year
+filtering, so two things were added on top of it per this task's explicit
+ask, pulled from `NEON_Download_Hyperspec.R`'s / `FieldDiversity.R`'s own
+NEONsites.csv crosswalk convention instead of inventing a new one: site
+list restricted to the 45 NEONsites.csv towers, and the year range derived
+from `div_1m2Data.csv`/`div_10m2Data100m2Data.csv`'s own `endDate`
+coverage (same "derive the range from what's actually needed" philosophy
+as `ExtractMODIS.R`'s date range).
+
+Not run against the live NEON API in this sandbox (no internet access) --
+`"vst_apparentindividual"`/`"vst_mappingandtagging"` are NEON's documented
+DP1.10098.001 table names, not confirmed against a real `loadByProduct()`
+response. The script prints `names(veg_structure_data)` unconditionally on
+every run and `stop()`s, listing what was actually returned, if either
+expected table is missing -- flagged clearly in a header caveat block
+(mirroring `ExtractMODIS.R`'s AppEEARS caveat) as needing inspection on the
+first real run rather than being assumed correct. Confirmed only that the
+script `parse()`s cleanly.
+
 ## 2026-09-11 23:51 UTC — FieldDiversity.R: add canopy-filtered floristic metrics via NEON vst_ (Vegetation Structure) data
 
 Added a parallel, additive set of metrics -- `floristic_richness_canopy`,
