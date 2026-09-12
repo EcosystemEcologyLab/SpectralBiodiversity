@@ -4,6 +4,39 @@ Committed, dated record of work performed in this repository. Reverse
 chronological order, newest entry at the top. See CLAUDE.md for the
 convention this file follows.
 
+## 2026-09-12 01:45 UTC — FieldDiversity.R: resolve taxonID conflicts via most-recent-date rule, audit trail, identity check on vst_apparentindividual duplicates
+
+Follow-up to the join fan-out fix (prior entry): the 172 individualIDs found
+with conflicting taxonID across duplicate vst_mappingandtagging rows were
+inspected -- consistent physical metadata (plot, stem distance/azimuth)
+across dates spanning YEARS (e.g. 2014 vs. 2025), read as a field ID
+corrected at a later revisit, not data corruption. DECISION: no
+special-casing -- the SAME most-recent-date dedup rule already used for the
+general re-tagging duplication resolves these identically (latest record
+authoritative for both). Replaced the prior hard stop() on taxonID
+conflicts with: (1) a check for exact ties on the max date (reported, not
+silently possible -- picked deterministically if it occurs), (2) an audit
+trail written to `./Data/NEON_FieldData/vst_taxonID_reassignments.csv`
+(individualID, old_taxonID, old_date, new_taxonID, new_date) documenting
+exactly what got overridden BEFORE the superseded rows are discarded --
+documentation/QA only, not read downstream -- then (3) the same dedup as
+before.
+
+Also investigated the 38,758 duplicate (individualID, date) pairs already
+found in vst_apparentindividual (not deduplicated -- repeat-visit structure
+is preserved) for an identity conflict analogous to the taxonID case:
+checks whether any such duplicate group disagrees on growthForm (found via
+find_optional_column, since the real column isn't known in this sandbox).
+If found, stop()s the same way the taxonID conflict did (not resolved
+silently); if not, confirms the any-exposed-individual classification rule
+is sufficient as-is, since canopyPosition disagreement between same-visit
+duplicate rows is expected/independent evidence, not an identity problem.
+
+Confirmed the script still parse()s cleanly. Not run against real data --
+none present in this sandbox; the corrected join match rate, relationship
+assertion, audit CSV contents, and growthForm check outcome will only be
+known on the next real run.
+
 ## 2026-09-12 01:32 UTC — FieldDiversity.R: fix join fan-out, correct categoricalCodes lookup, extend canopy classification to vst_non-woody
 
 Two more issues surfaced by a real run, plus the extension originally

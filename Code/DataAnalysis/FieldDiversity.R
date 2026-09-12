@@ -418,52 +418,171 @@ cat("\nvst_mappingandtagging:", length(mapping_dupe_ids), "of",
     n_distinct(vst_mapping[[individual_col_mapping]]),
     "distinct individualIDs have MORE THAN ONE row (", nrow(vst_mapping), "total rows).\n")
 
+conflict_ids <- character(0)
 if (length(mapping_dupe_ids) > 0) {
   cat("Full rows for the first few duplicated individualIDs (inspect the actual pattern",
       "before deduplicating):\n")
   print(vst_mapping %>% filter(.data[[individual_col_mapping]] %in% head(mapping_dupe_ids, 5)) %>%
           arrange(.data[[individual_col_mapping]]))
 
-  # ---- Mandatory check: do any duplicate individualID groups disagree on
-  # taxonID? If so this is a genuine identity conflict, not benign
-  # re-tagging/re-mapping history, and must not be resolved by picking a
-  # row automatically -- stop() and surface it for a human decision, per
-  # this project's established discipline.
+  # ---- taxonID conflicts within duplicate individualID groups. A real run
+  # found 172 such individualIDs; inspection showed duplicate rows sharing
+  # consistent physical metadata (plot, stem distance/azimuth) but
+  # differing taxonID across dates spanning YEARS (e.g. 2014 vs. 2025, 2022
+  # vs. 2025). Read as a field identification corrected at a later revisit
+  # -- an expected pattern in decade-spanning ecological monitoring, not
+  # data corruption.
+  #
+  # DECISION: resolved by the SAME most-recent-date rule applied to every
+  # duplicated individualID below (see dedup block) -- these 172 cases need
+  # no special-casing, since "the latest record is authoritative" already
+  # resolves both the general re-tagging duplication and the specific
+  # taxonID disagreements identically. Before the superseded taxonID is
+  # discarded for these specific individuals, an audit trail is written
+  # (below, after the dedup) documenting exactly what was overridden --
+  # this is NOT a silent resolution, it's a documented one.
   taxon_conflicts <- vst_mapping %>%
     filter(.data[[individual_col_mapping]] %in% mapping_dupe_ids) %>%
     group_by(.data[[individual_col_mapping]]) %>%
     summarise(n_taxa = n_distinct(.data[[taxon_col_mapping]]), .groups = "drop") %>%
     filter(n_taxa > 1)
+  conflict_ids <- taxon_conflicts[[individual_col_mapping]]
 
-  if (nrow(taxon_conflicts) > 0) {
-    conflict_ids <- taxon_conflicts[[individual_col_mapping]]
-    cat("\n!! taxonID CONFLICTS found within duplicate individualID groups:\n")
-    print(vst_mapping %>% filter(.data[[individual_col_mapping]] %in% conflict_ids) %>%
-            arrange(.data[[individual_col_mapping]]))
-    stop(length(conflict_ids), " individualID(s) in vst_mappingandtagging are associated with ",
-         "MORE THAN ONE distinct taxonID across their duplicate rows (printed above) -- this is ",
-         "a genuine identity conflict, not benign re-tagging history, and cannot be resolved by ",
-         "picking a row automatically. Investigate these specific individualIDs and decide how ",
-         "to resolve them before deduplicating; do not guess.")
+  if (length(conflict_ids) > 0) {
+    cat("\n", length(conflict_ids), " individualID(s) have duplicate rows disagreeing on ",
+        "taxonID -- resolved by the most-recent-date rule below (see the audit trail written ",
+        "to ./Data/NEON_FieldData/vst_taxonID_reassignments.csv for exactly what was ",
+        "overridden).\n", sep = "")
+  } else {
+    cat("\nNo taxonID conflicts found within duplicate individualID groups -- duplicates appear",
+        "to be benign re-tagging/re-mapping history with a consistent species call.\n")
   }
-  cat("\nNo taxonID conflicts found within duplicate individualID groups -- duplicates appear to",
-      "be benign re-tagging/re-mapping history (same species, multiple dated records). Safe to",
-      "deduplicate by keeping the most recent record per individualID.\n")
 }
 
 # ---- Deduplicate vst_mappingandtagging to one row per individualID,
-# keeping the most recent `date` as the tiebreaker -- applied BEFORE the
-# join, not as a post-hoc filter on already-fanned-out rows.
-# vst_apparentindividual is NOT deduplicated (its repeat-visit rows are
-# legitimate, independent canopyPosition evidence, confirmed above).
-vst_mapping_deduped <- vst_mapping %>%
-  mutate(.dedupe_date = suppressWarnings(as.Date(.data[[date_col_mapping]]))) %>%
+# keeping the most recent `date` -- ONE consistent rule applied to ALL
+# duplicated individualIDs, whether or not they show a taxonID conflict, so
+# the 172 conflicting cases are not special-cased separately from the
+# general re-tagging duplication. Applied BEFORE the join, not as a
+# post-hoc filter on already-fanned-out rows. vst_apparentindividual is NOT
+# deduplicated (its repeat-visit rows are legitimate, independent
+# canopyPosition evidence, confirmed above).
+vst_mapping_dated <- vst_mapping %>%
+  mutate(.dedupe_date = suppressWarnings(as.Date(.data[[date_col_mapping]])))
+
+# Exact ties on the max date within one individualID can't be broken by
+# date alone -- reported here rather than silently, in case it ever
+# actually occurs; the first such row encountered after arrange() is kept
+# deterministically regardless.
+exact_date_ties <- vst_mapping_dated %>%
+  group_by(.data[[individual_col_mapping]]) %>%
+  filter(.dedupe_date == max(.dedupe_date, na.rm = TRUE)) %>%
+  summarise(n_at_max_date = n(), .groups = "drop") %>%
+  filter(n_at_max_date > 1)
+if (nrow(exact_date_ties) > 0) {
+  cat("\n!!", nrow(exact_date_ties), "individualID(s) have an exact TIE on the maximum date --",
+      "date alone cannot fully resolve these; the first such row encountered after arrange()",
+      "is kept. Inspect if this matters for any of the taxonID-conflict cases specifically:\n")
+  print(head(exact_date_ties, 10))
+} else {
+  cat("\nNo exact ties on the maximum date within any duplicated individualID -- the",
+      "most-recent-date rule resolves every case unambiguously.\n")
+}
+
+# ---- Audit trail for taxonID reassignments -- written BEFORE the
+# superseded rows are discarded by the dedup below. Documentation/QA only;
+# not read anywhere downstream in the canopy-filtering logic itself.
+if (length(conflict_ids) > 0) {
+  conflict_rows <- vst_mapping_dated %>%
+    filter(.data[[individual_col_mapping]] %in% conflict_ids) %>%
+    arrange(.data[[individual_col_mapping]], desc(.dedupe_date))
+
+  kept_rows <- conflict_rows %>%
+    group_by(.data[[individual_col_mapping]]) %>%
+    slice(1) %>%
+    ungroup() %>%
+    transmute(individualID = .data[[individual_col_mapping]],
+              new_taxonID  = .data[[taxon_col_mapping]],
+              new_date     = .dedupe_date)
+
+  superseded_rows <- conflict_rows %>%
+    group_by(.data[[individual_col_mapping]]) %>%
+    slice(-1) %>%
+    ungroup() %>%
+    transmute(individualID = .data[[individual_col_mapping]],
+              old_taxonID  = .data[[taxon_col_mapping]],
+              old_date     = .dedupe_date)
+
+  reassignment_audit <- superseded_rows %>%
+    inner_join(kept_rows, by = "individualID") %>%
+    filter(old_taxonID != new_taxonID) %>%
+    select(individualID, old_taxonID, old_date, new_taxonID, new_date)
+
+  audit_path <- "./Data/NEON_FieldData/vst_taxonID_reassignments.csv"
+  write.csv(reassignment_audit, audit_path, row.names = FALSE)
+  cat("\nWrote", nrow(reassignment_audit), "taxonID reassignment(s) for", length(conflict_ids),
+      "individualID(s) to", audit_path, "(a conflicting individualID with more than 2 total",
+      "rows produces one audit row per superseded record that actually disagrees with the",
+      "kept taxonID).\n")
+}
+
+vst_mapping_deduped <- vst_mapping_dated %>%
   arrange(.data[[individual_col_mapping]], desc(.dedupe_date)) %>%
   distinct(across(all_of(individual_col_mapping)), .keep_all = TRUE) %>%
   select(-.dedupe_date)
 
 cat("\nDeduplicated vst_mappingandtagging:", nrow(vst_mapping), "->", nrow(vst_mapping_deduped),
-    "rows (one per individualID).\n")
+    "rows (one per individualID;", length(mapping_dupe_ids), "individualID(s) were",
+    "deduplicated, including", length(conflict_ids), "with a taxonID reassignment).\n")
+
+# ---- The 38,758 duplicate (individualID, date) pairs found in
+# vst_apparentindividual (see apparent_dupe_visits above) are NOT
+# deduplicated -- repeat-visit structure is preserved. But same-visit
+# duplicates deserve the same identity-conflict check just applied to
+# vst_mappingandtagging: canopyPosition is EXPECTED to vary/disagree
+# between duplicate rows (independent readings, and the any-exposed-
+# individual rule is designed around exactly that), but a disagreement on
+# an identity-relevant field (growthForm) at the SAME visit would mean
+# individualID isn't uniquely identifying at that resolution -- a genuine
+# data-quality concern, not something the any()-based classification can
+# paper over. Flagged the same way as the taxonID conflict (stop(), not a
+# silent resolution) if found.
+growthform_col_apparent <- find_optional_column(vst_apparent, "^growthform$")
+
+if (nrow(apparent_dupe_visits) == 0) {
+  cat("\nvst_apparentindividual: no duplicate (individualID, date) pairs exist, so there is",
+      "nothing to identity-check here.\n")
+} else if (is.na(growthform_col_apparent)) {
+  cat("\nvst_apparentindividual: no growthForm-like column found to cross-check duplicate",
+      "(individualID, date) groups against -- could not confirm identity consistency beyond",
+      "canopyPosition itself. canopyPosition disagreement within a duplicate group is treated",
+      "as expected (independent readings), not an identity conflict, consistent with why these",
+      "rows are preserved rather than deduplicated.\n")
+} else {
+  apparent_identity_conflicts <- vst_apparent %>%
+    inner_join(apparent_dupe_visits %>% select(all_of(c(individual_col_apparent, date_col_apparent))),
+               by = c(individual_col_apparent, date_col_apparent)) %>%
+    group_by(.data[[individual_col_apparent]], .data[[date_col_apparent]]) %>%
+    summarise(n_growthforms = n_distinct(.data[[growthform_col_apparent]]), .groups = "drop") %>%
+    filter(n_growthforms > 1)
+
+  if (nrow(apparent_identity_conflicts) > 0) {
+    cat("\n!! ", nrow(apparent_identity_conflicts), " duplicate (individualID, date) group(s) in ",
+        "vst_apparentindividual disagree on '", growthform_col_apparent, "':\n", sep = "")
+    print(head(apparent_identity_conflicts, 10))
+    stop(nrow(apparent_identity_conflicts), " duplicate (individualID, date) group(s) in ",
+         "vst_apparentindividual disagree on '", growthform_col_apparent, "' -- a genuine ",
+         "identity conflict at the SAME visit, not independent multi-year evidence like the ",
+         "vst_mappingandtagging case. Investigate before trusting the any-exposed-individual ",
+         "classification for these individuals; not resolved automatically.")
+  }
+  cat("\nvst_apparentindividual: no duplicate (individualID, date) group disagrees on '",
+      growthform_col_apparent, "' -- the any-exposed-individual canopy classification rule is",
+      " confirmed sufficient without further changes here. Same-visit duplicate rows describe",
+      " the same individual consistently; multiple canopyPosition votes (agreeing or",
+      " disagreeing on EXPOSURE, which is expected to genuinely vary by reading) don't reflect",
+      " an identity problem the way a taxonID mismatch would.\n", sep = "")
+}
 
 # ---- vst_apparentindividual (repeated per-visit measurements, incl.
 # canopyPosition) carries no taxonID of its own -- species identity lives on
