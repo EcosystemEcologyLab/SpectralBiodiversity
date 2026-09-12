@@ -4,6 +4,68 @@ Committed, dated record of work performed in this repository. Reverse
 chronological order, newest entry at the top. See CLAUDE.md for the
 convention this file follows.
 
+## 2026-09-12 00:59 UTC — FieldDiversity.R: NA canopyPosition no longer treated as shading evidence
+
+Follow-up to the NA-canopyPosition diagnostic added in the prior entry
+(below): fixed the actual classification logic in `build_site_canopy_
+lookup()` rather than only reporting the issue. Individuals with `NA`
+canopyPosition are now excluded from exposed/shaded evidence entirely --
+a species is `"exposed"` if ANY individual with a non-NA canopyPosition is
+in an exposed category, `"understory"` only if it has at least one non-NA
+individual and none are exposed, and if EVERY individual has NA
+canopyPosition the taxon(+plot) group is now dropped from the lookup table
+so `classify_canopy_status()`'s existing missing-key fallback classifies it
+`"unmeasured"` -- the same bucket already used for species entirely absent
+from vst_, since both are the same underlying situation (no measured
+evidence, not confirmed non-exposure). Implemented via `case_when(all(is.na(
+canopyPosition)) ~ NA_character_, any(is_exposed) ~ "exposed", TRUE ~
+"understory")` followed by `filter(!is.na(canopy_status))`.
+
+The NA-diagnostic `cat()` added previously is now an accurate description of
+the fix's effect rather than a "not yet applied" note -- it reports exactly
+how many taxon(+plot) groups move from the old (incorrect) `"understory"`
+classification to the corrected `"unmeasured"` one. Confirmed the script
+still `parse()`s cleanly; not run against real data (none present in this
+sandbox).
+
+## 2026-09-12 00:45 UTC — FieldDiversity.R: fix vst_mappingandtagging.csv parsing corruption, resolve unmapped "Mostly shaded" category
+
+A real run surfaced two issues. (1) `vst_mappingandtagging.csv` was loading
+only 3,189 of the 158,898 rows the download step originally wrote, with
+"EOF within quoted string" -- the signature of a stray unescaped `"` in one
+of this table's free-text columns (remarks/identificationQualifier/etc.)
+breaking base `read.csv()`'s quote-balancing parser for the rest of the
+file. Added a raw-line odd-quote-count scan to surface the likely offending
+line number(s), and switched this file's read (only this file -- checked
+`vst_apparentindividual.csv` for the same fingerprint and found none, left
+its `read.csv()` call untouched) to `readr::read_csv()`, which tokenizes
+around a malformed quote far more gracefully; `problems()` output is
+printed if any remain. The apparentindividual x mappingandtagging join's
+match-rate is now printed as a percentage with an explicit flag if it's
+still under 50% after the fix, so a genuinely separate join problem
+wouldn't be masked as "the parsing fix must have handled it."
+
+(2) The real `canopyPosition` vocabulary included a fifth category,
+`"Mostly shaded"` (39,490 of 502,012 rows), not covered by the existing
+`exposed_categories`/`shaded_categories` lists -- correctly `stop()`ed
+rather than guess. Added best-effort investigation code reading
+`categoricalCodes_10098.csv` for authoritative field definitions (falls
+back gracefully, not a hard stop, if the file/columns aren't as expected).
+This sandbox has no access to that file to confirm the real definition
+text, so `"Mostly shaded"` was placed in `shaded_categories` by an explicit,
+flagged ORDINAL judgment call (majority-shade sits opposite
+majority-sun "Partially shaded" on the 50% line implied by the labels) --
+all five categories' placements (including the four assumed before this
+fix) are flagged for re-verification against the printed definitions on the
+next real run.
+
+Also added a report-only diagnostic (superseded by the next entry, above)
+noting that `NA` canopyPosition rows (338,712 of 502,012 -- the majority)
+were being treated as shading evidence rather than a data gap, inconsistent
+with the unmeasured-species philosophy -- reported and proposed a fix
+rather than silently changing it, per instruction. Confirmed the script
+still `parse()`s cleanly; not run against real data.
+
 ## 2026-09-12 00:04 UTC — Add NEON_Download_VegStructure.R: DP1.10098.001 download script for FieldDiversity.R's canopy metrics
 
 New `Code/DataDownload/NEON_Download_VegStructure.R`, downloading NEON

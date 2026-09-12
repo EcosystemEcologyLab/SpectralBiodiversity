@@ -62,6 +62,7 @@ library(purrr)
 library(stringr)
 library(tibble)
 library(hillR)
+library(readr)
 
 # ============================================================================
 # 0. Setup / paths
@@ -282,7 +283,67 @@ find_one_column <- function(df, pattern, df_name) {
 }
 
 vst_apparent <- read.csv(vst_apparent_path, fileEncoding = "UTF-8-BOM")
-vst_mapping  <- read.csv(vst_mapping_path,  fileEncoding = "UTF-8-BOM")
+
+# ---- vst_mappingandtagging.csv: a real run found base read.csv() silently
+# truncating this file (158,898 rows written at download time -> only 3,189
+# rows loaded here), with "invalid input found on input connection" / "EOF
+# within quoted string" -- the classic signature of an unescaped stray `"`
+# inside one of this table's several free-text columns (remarks,
+# identificationQualifier, morphospeciesIDRemarks, etc.), which makes
+# read.csv()'s quote-balancing parser treat everything after that point as
+# still inside one open quoted field, corrupting/dropping the remainder of
+# the file. A line with an ODD count of `"` characters is the fingerprint of
+# exactly this failure mode -- scanned for here (not hand-patched into the
+# source file, per this project's write-safety convention of never editing a
+# raw downloaded data file) so the actual offending line is visible rather
+# than "somewhere in there".
+mapping_raw_lines  <- readLines(vst_mapping_path, warn = FALSE)
+mapping_quote_counts <- lengths(regmatches(mapping_raw_lines, gregexpr('"', mapping_raw_lines)))
+mapping_odd_quote_lines <- which(mapping_quote_counts %% 2 == 1)
+if (length(mapping_odd_quote_lines) > 0) {
+  cat("\nvst_mappingandtagging.csv: line(s) with an ODD '\"' count (likely source of the",
+      "CSV-quoting parse failure) at line number(s):\n")
+  print(head(mapping_odd_quote_lines, 20))
+} else {
+  cat("\nvst_mappingandtagging.csv: no odd-quote-count line found by the raw scan -- the",
+      "malformed-quote diagnosis may not be the exact mechanism here; check the",
+      "readr::read_csv() problems() printout below instead.\n")
+}
+
+# Checked (not assumed) whether vst_apparentindividual.csv -- same download,
+# same product -- shows the same fingerprint before leaving its read.csv()
+# call unchanged.
+apparent_raw_lines  <- readLines(vst_apparent_path, warn = FALSE)
+apparent_quote_counts <- lengths(regmatches(apparent_raw_lines, gregexpr('"', apparent_raw_lines)))
+apparent_odd_quote_lines <- which(apparent_quote_counts %% 2 == 1)
+if (length(apparent_odd_quote_lines) > 0) {
+  cat("vst_apparentindividual.csv ALSO has", length(apparent_odd_quote_lines),
+      "odd-quote-count line(s) -- this file may have the same read.csv() truncation problem;",
+      "investigate before trusting its row count (nrow =", nrow(vst_apparent), ") too.\n")
+} else {
+  cat("vst_apparentindividual.csv: no odd-quote-count lines found -- no evidence of the same",
+      "parsing problem, read.csv() left unchanged for this file (nrow =", nrow(vst_apparent), ").\n")
+}
+
+# Switched to readr::read_csv() for THIS file only -- it tokenizes fields
+# far more defensively around a malformed embedded quote (reports the
+# problem via problems() and keeps parsing, rather than base read.csv()'s
+# all-or-nothing quote-balancing that silently drops everything after the
+# first bad quote). div_1m2Data.csv/div_10m2Data100m2Data.csv and
+# vst_apparentindividual.csv are untouched -- no evidence found above that
+# they share this problem.
+vst_mapping <- read_csv(vst_mapping_path, show_col_types = FALSE, progress = FALSE)
+mapping_parse_problems <- problems(vst_mapping)
+if (nrow(mapping_parse_problems) > 0) {
+  cat("\nvst_mappingandtagging.csv: read_csv() reported", nrow(mapping_parse_problems),
+      "parsing problem(s):\n")
+  print(mapping_parse_problems)
+}
+cat("\nLoaded", nrow(vst_mapping), "rows from vst_mappingandtagging.csv via read_csv()",
+    "-- compare against the row count NEON_Download_VegStructure.R's own \"Wrote ...\"",
+    "message reported at download time (158,898 on the run that surfaced this bug) to",
+    "confirm the fix worked. If this is still far below that, the fix above did not fully",
+    "resolve it -- investigate further rather than assuming success.\n")
 
 cat("\n==== STEP 1B: vst_ (Vegetation Structure) structure investigation ====\n")
 cat("vst_apparentindividual: ", nrow(vst_apparent), " rows, columns:\n", sep = "")
@@ -328,17 +389,85 @@ if (nrow(vst_joined) == 0) {
        "Investigate the real join key before proceeding; do not guess.")
 }
 
+join_match_rate <- nrow(vst_joined) / nrow(vst_apparent)
 cat("\nJoined vst_apparentindividual x vst_mappingandtagging by individualID:",
-    nrow(vst_joined), "of", nrow(vst_apparent), "apparentindividual rows matched.\n")
+    nrow(vst_joined), "of", nrow(vst_apparent), "apparentindividual rows matched",
+    "(", round(100 * join_match_rate, 1), "%).\n")
+if (join_match_rate < 0.5) {
+  cat("!! Match rate is still under 50% -- a run that previously saw 14,734/502,012 (2.9%)",
+      "matched against a truncated vst_mappingandtagging.csv (see the read_csv() fix above)",
+      "should climb sharply once the parsing fix is in effect. If it's STILL this low after",
+      "that fix, that points to a separate, real issue (e.g. individualIDs genuinely absent",
+      "from the mapping table) -- investigate rather than assuming the parsing fix alone",
+      "explains the remainder.\n")
+}
 
-# ---- exposed vs. shaded category mapping -- PROVISIONAL, based on NEON's
-# documented canopyPosition controlled vocabulary, not yet confirmed against
-# a real file (see STEP 1B printout above). If real data contains a category
-# not listed here, this stops rather than silently defaulting it to either
-# side of the exposed/shaded line -- extend the two vectors below with an
-# explicit human decision once the real categories are visible.
+# ---- Attempt to confirm exposed/shaded placement against NEON's
+# authoritative categoricalCodes_10098.csv definitions, rather than the
+# label text alone. Best-effort: a missing file or unexpected column layout
+# falls back to the documented judgment call below rather than blocking the
+# whole script on a reference-table lookup.
+categorical_codes_path <- "./Data/NEON_FieldData/categoricalCodes_10098.csv"
+if (file.exists(categorical_codes_path)) {
+  categorical_codes <- read.csv(categorical_codes_path, fileEncoding = "UTF-8-BOM")
+  cc_field_col <- tryCatch(find_one_column(categorical_codes, "^fieldname$", "categoricalCodes_10098"), error = function(e) NA)
+  cc_name_col  <- tryCatch(find_one_column(categorical_codes, "^name$", "categoricalCodes_10098"), error = function(e) NA)
+  cc_def_col   <- tryCatch(find_one_column(categorical_codes, "definition", "categoricalCodes_10098"), error = function(e) NA)
+  if (!is.na(cc_field_col) && !is.na(cc_name_col) && !is.na(cc_def_col)) {
+    canopy_position_definitions <- categorical_codes %>%
+      filter(.data[[cc_field_col]] == "canopyPosition") %>%
+      transmute(category = .data[[cc_name_col]], definition = .data[[cc_def_col]])
+    cat("\n==== categoricalCodes_10098.csv: canopyPosition definitions ====\n")
+    if (nrow(canopy_position_definitions) > 0) {
+      print(as.data.frame(canopy_position_definitions))
+      cat("REVIEW the definitions printed above against the exposed_categories/",
+          "shaded_categories placement below -- especially \"Mostly shaded\", added on",
+          "an ordinal judgment call (see comment) because this codebase could not read",
+          "this file's real contents at the time that call was written. Correct the two",
+          "vectors below if the printed definitions disagree with any of the five",
+          "placements.\n")
+    } else {
+      cat("(no rows with fieldName == \"canopyPosition\" found -- this file may use a",
+          "different field-name spelling, or doesn't cover this field. Falling back to",
+          "the ordinal judgment call below.)\n")
+    }
+  } else {
+    cat("\ncategoricalCodes_10098.csv exists but doesn't have the expected fieldName/name/",
+        "definition columns (found:", paste(names(categorical_codes), collapse = ", "),
+        ") -- cannot confirm category definitions against it programmatically here;",
+        "inspect it by hand if the judgment call below needs revisiting.\n")
+  }
+} else {
+  cat("\ncategoricalCodes_10098.csv not found at", categorical_codes_path, "-- cannot confirm",
+      "canopyPosition category definitions against an authoritative source in this run;",
+      "using the ordinal judgment call below instead.\n")
+}
+
+# ---- exposed vs. shaded category mapping.
+# "Full sun"/"Open grown"/"Partially shaded" (exposed) and "Full shade"
+# (shaded) were the original PROVISIONAL placements, based on NEON's
+# documented vocabulary, not a confirmed definition-file read. A real run
+# then surfaced a fifth category, "Mostly shaded" (39,490 of 502,012 rows),
+# which correctly stop()ed the original version of this script rather than
+# silently guessing.
+#
+# "Mostly shaded" is placed on the SHADED side here by ORDINAL JUDGMENT
+# CALL, NOT a confirmed categoricalCodes_10098.csv definition -- this
+# codebase has no access to real NEON data/files to read that definition
+# text directly (see the investigation block immediately above, which DOES
+# read and print the real definitions when this script is actually run;
+# check that printout and correct this placement if it disagrees). The
+# judgment: NEON's canopyPosition vocabulary orders by degree of light
+# exposure, roughly Full shade < Mostly shaded < Partially shaded <
+# Partially shaded < Full sun / Open grown; "Partially shaded" (majority
+# sun -- already placed exposed) and "Mostly shaded" (majority shade) sit
+# on opposite sides of the 50% line implied by their own labels, so
+# "Mostly shaded" goes with "Full shade" rather than with "Partially
+# shaded". All five categories' placements, including the four assumed
+# before this fix, should be re-verified against the printed definitions
+# above rather than trusted as previously confirmed.
 exposed_categories <- c("Full sun", "Open grown", "Partially shaded")
-shaded_categories  <- c("Full shade")
+shaded_categories  <- c("Full shade", "Mostly shaded")
 
 observed_categories <- unique(na.omit(vst_joined$canopyPosition))
 unmapped_categories <- setdiff(observed_categories, c(exposed_categories, shaded_categories))
@@ -366,6 +495,30 @@ cat("\nvst_ plotID / diversity-data plotID overlap:", length(plot_overlap), "of"
 canopy_linkage_granularity <- if (plot_overlap_frac > 0.5) "plot" else "site"
 cat("Canopy linkage granularity achieved: '", canopy_linkage_granularity, "'.\n", sep = "")
 
+# ---- NA canopyPosition diagnostic. A real run found 338,712 of 502,012
+# vst_apparentindividual rows (67%) have canopyPosition == NA (apparently
+# not recorded at every visit for every individual). FIXED below: NA rows
+# are now excluded from exposed/shaded evidence entirely -- a data gap is
+# not confirmed non-exposure, matching the unmeasured_species_treatment
+# philosophy already established for species entirely absent from vst_.
+# The count printed here is exactly the set of taxon(+plot) groups this fix
+# moves from the old (incorrect) "understory" classification to the
+# corrected "unmeasured" one -- every one of these groups has zero
+# individuals with a usable (non-NA) canopyPosition, so build_site_
+# canopy_lookup() below now omits them from its lookup table entirely,
+# which is what makes classify_canopy_status() fall through to its
+# "unmeasured" default for them.
+na_canopy_group_cols <- if (canopy_linkage_granularity == "plot") c("plotID", "taxonID") else "taxonID"
+na_canopy_diagnostic <- vst_joined %>%
+  group_by(across(all_of(na_canopy_group_cols))) %>%
+  summarise(all_na = all(is.na(canopyPosition)), .groups = "drop")
+cat("\nNA canopyPosition diagnostic:", sum(is.na(vst_joined$canopyPosition)), "of",
+    nrow(vst_joined), "vst_joined rows have NA canopyPosition;", sum(na_canopy_diagnostic$all_na),
+    "of", nrow(na_canopy_diagnostic), canopy_linkage_granularity, "-level taxon group(s) have",
+    "canopyPosition == NA for EVERY recorded individual -- these move from 'understory' (the",
+    "prior, incorrect behavior) to 'unmeasured' (the corrected behavior) as a result of the",
+    "NA-handling fix in build_site_canopy_lookup() below.\n")
+
 # ---- STEP 2: per-species canopy-status classification, "any exposed
 # individual" rule (permissive -- flagged choice, see task note). A stricter
 # alternative (e.g. >50% of a species' measured individuals exposed, where N
@@ -373,6 +526,18 @@ cat("Canopy linkage granularity achieved: '", canopy_linkage_granularity, "'.\n"
 # implemented here. Computed ONCE per site, reused across every
 # bout/plot_scope/temporal_scope combo for that site (it doesn't vary by any
 # of those axes).
+#
+# NA canopyPosition individuals are excluded from exposed/shaded evidence
+# entirely (neither "this species is exposed" nor "this species is
+# understory" evidence) -- a species is "exposed" if ANY individual with a
+# non-NA canopyPosition is in an exposed category; "understory" if it has
+# at least one non-NA individual and none of them are exposed; and if EVERY
+# individual has NA canopyPosition (no usable classification at all), the
+# group is dropped from the lookup table here so classify_canopy_status()'s
+# existing missing-key fallback classifies it "unmeasured" -- the same
+# bucket used for species entirely absent from vst_ data, since both cases
+# are the same thing: no measured evidence either way, not confirmed
+# non-exposure.
 build_site_canopy_lookup <- function(nsite) {
   va_site <- vst_joined %>% filter(siteID == nsite)
   if (nrow(va_site) == 0) return(tibble(key = character(), canopy_status = character()))
@@ -381,7 +546,15 @@ build_site_canopy_lookup <- function(nsite) {
   va_site %>%
     mutate(is_exposed = canopyPosition %in% exposed_categories) %>%
     group_by(across(all_of(group_cols))) %>%
-    summarise(canopy_status = if (any(is_exposed)) "exposed" else "understory", .groups = "drop") %>%
+    summarise(
+      canopy_status = case_when(
+        all(is.na(canopyPosition)) ~ NA_character_,
+        any(is_exposed)            ~ "exposed",
+        TRUE                       ~ "understory"
+      ),
+      .groups = "drop"
+    ) %>%
+    filter(!is.na(canopy_status)) %>%
     mutate(key = if (canopy_linkage_granularity == "plot") paste(plotID, taxonID, sep = "\r") else taxonID) %>%
     select(key, canopy_status)
 }
