@@ -4,6 +4,74 @@ Committed, dated record of work performed in this repository. Reverse
 chronological order, newest entry at the top. See CLAUDE.md for the
 convention this file follows.
 
+## 2026-09-18 21:31 UTC — New Code/CanopyDeltaByEcosystem.R: canopy-filter delta by tower/ecosystem, self-tested on synthetic data
+
+New script (not modifying `CompareSpectralVsFieldDiversity.R`) answering
+whether canopy-filtering's effect on field diversity concentrates by
+ecosystem type: per tower, computes `richness_delta` (unfiltered minus
+canopy-filtered richness), `shannon_delta` (same, mean Shannon), and
+`pct_filtered`, joins each tower to an IGBP ecosystem label, and plots both
+deltas as one bar per tower (ALL towers, including zero-delta ones) colored
+by ecosystem.
+
+**Veg Type investigation (task item 1):** `./Data/NEONsites.csv` -- the path
+FieldDiversity.R's own site_xwalk already reads -- does not exist in this
+sandbox (no `Data/` directory at all, consistent with every prior session).
+The only real candidate found was the untracked repo-root file
+`NEONsites_Footprints.csv`, whose `Site.ID`/`Site.Name`/`Veg Type` columns
+exactly match the schema FieldDiversity.R's `site_xwalk` already expects
+from `NEONsites.csv` (`Site.ID` values like "US-xAB", `Site.Name` like "NEON
+Abby Road (ABBY)") -- strongly suggesting it's the same or a compatible
+source, though this is inferred, not confirmed, since the filenames and
+locations differ. Investigated it directly rather than assuming: the real
+`Veg Type` column (45 rows, R-sanitized to `Veg.Type`) holds 3-letter IGBP
+abbreviations -- observed values CRO, CVM, DBF, EBF, ENF, GRA, MF, OSH, SAV,
+WET (10 of the standard 17) -- NOT numeric codes or full names. This matches
+AmeriFlux's own site-page vegetation-abbreviation convention (this same file
+has a "Hub" column reading "AmeriFlux" throughout), which is corroborating
+evidence, not proof. Mapped against the full standard IGBP 17-class legend
+in the new script, with a `stop()` if any observed code isn't in that
+legend (none were, for the codes checked above) -- flagged explicitly in
+the script as an assumption to reconfirm once the real `./Data/NEONsites.csv`
+is available, not a settled fact.
+
+**Field-resolution reuse (task item 2):** confirmed this repo's established
+convention for reusing logic out of a monolithic, non-function-library
+script is `import_functions_from()` (already used identically in
+`ComputeLUE.R`/`ComputeLUE_Annual.R`/`CompareSSR_AdaptiveFCM_vs_KMeans.R`) --
+NOT plain `source()`, which would re-trigger `CompareSpectralVsFieldDiversity.R`'s
+own downstream rank-order tests/plots/`ggsave()` calls as a side effect.
+Imported `field_csv` -> `field` -> `field_resolved` in dependency order (each
+is a real top-level binding in the origin script, evaluated in sequence into
+one env so later bindings can see earlier ones) -- this is the exact
+peak-flight-preferred, per-bout-averaged resolution logic, single-sourced,
+not reimplemented. The per-tower averaging step (group_by + summarise +
+across(mean, na.rm=TRUE)) is applied directly to `field_resolved` rather
+than to `joined_by_year` as in the origin script, since this script has no
+use for the spectral join at all -- same aggregation call, just skipping a
+join step that isn't relevant here (documented in-script as an adaptation,
+not a from-scratch reimplementation).
+
+**Self-tested end-to-end** (synthetic `field_diversity_long.csv` + a
+synthetic `NEONsites.csv`, 15 towers, in a scratch dir mirroring the real
+`Code/`/`Data/` layout so `import_functions_from()` could actually parse
+`CompareSpectralVsFieldDiversity.R`): ran to completion with no errors.
+Confirmed: one tower deliberately given no NEONsites.csv match is correctly
+labeled "Unknown" (not dropped) and reported to console; one tower given
+`floristic_richness == 0` correctly produces `pct_filtered = NA` (not
+Inf/NaN) and a blank bar-label rather than crashing; all 15 towers appear in
+both bar charts including near-zero-delta ones; both PNGs and
+`canopy_delta_by_tower.csv` were written successfully. Script also confirmed
+to `parse()` cleanly on its own.
+
+**Not verified against real data:** this sandbox has neither `Data/` nor a
+confirmed real `NEONsites.csv`, so the actual per-tower deltas, whether the
+effect concentrates in GRSM/UNDE/HARV-type forest sites, and whether the
+IGBP mapping holds against the REAL `./Data/NEONsites.csv` (vs. the
+repo-root stand-in used here) are all unknown until run outside this
+sandbox. New file `Code/CanopyDeltaByEcosystem.R` is untracked; not
+committed or pushed per the task's explicit instruction.
+
 ## 2026-09-18 21:00 UTC — CompareSpectralVsFieldDiversity.R: add canopy-filtered comparisons, self-tested on synthetic data (no real data in this sandbox)
 
 Extended `Code/CompareSpectralVsFieldDiversity.R` to compare the spectral
