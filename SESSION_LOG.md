@@ -4,6 +4,48 @@ Committed, dated record of work performed in this repository. Reverse
 chronological order, newest entry at the top. See CLAUDE.md for the
 convention this file follows.
 
+## 2026-09-18 20:01 UTC — vst_non-woody.csv read fix + multi-site spot check: verified already present, not run (no data/hillR in this sandbox)
+
+Requested task: apply the same `readr::read_csv()` fix already used for
+`vst_mappingandtagging.csv` to `vst_non-woody.csv` (a real run had found the
+same base `read.csv()` quote-balancing failure silently truncating it to
+13,916 of 76,976 rows, with `canopyPosition` showing 100% NA on that
+truncated slice), re-verify the `canopyPosition` distribution on the
+corrected full file, and generalize the ABBY-only spot check to 2-3+
+additional sites.
+
+Found the requested code changes ALREADY PRESENT in the working tree as an
+uncommitted diff (not attributable to this session -- present before this
+task began, not logged in a prior entry): the `vst_nonwoody` read is already
+switched to `readr::read_csv()` with the same odd-quote-count raw-line scan
+and `problems()` check pattern used for `vst_mappingandtagging`, and the
+spot check is already generalized from a single hardcoded site into
+`run_spot_check(sc_tid, sc_yr)` run over up to 4 distinct site-years
+(`spot_check_candidates`) rather than just ABBY. The `canopyPosition`
+distribution check, categoricalCodes cross-reference, and any-exposed-wins
+integration logic for `vst_non-woody` (items 3-5 of the request) were
+already implemented in an earlier commit (`abe1076`) and did not need
+changes -- they were only ever fed bad data by the broken read, not
+themselves broken.
+
+Verified: `readr` is loaded at the top of the script (used identically for
+the earlier `vst_mappingandtagging` fix); the file still `parse()`s cleanly
+end-to-end (Rscript parse check). Did NOT write any additional code, since
+the requested fix and generalization were already there.
+
+NOT RUN, and none of the report items below can be answered: this sandbox
+has no `./Data/` directory at all (confirmed via `find /` -- no
+`vst_non-woody*` or `vst_mappingandtagging*` file exists anywhere), and
+`hillR`, a hard dependency of this script's diversity calculations, is not
+installed here either (`readr`/`dplyr`/`rhdf5` are; `hillR` is not). So:
+the corrected row count vs. 76,976, the real `canopyPosition` value
+distribution, whether the ABBY 2017 spot-check numbers changed, and the
+2-3 additional site results are all unknown from this session -- they
+require running the script outside this sandbox against the real
+`Data/NEON_FieldData/` files. Not committed or pushed per the task's
+explicit instruction (and per this repo's standing commit-only-when-asked
+convention).
+
 ## 2026-09-18 00:30 UTC — FieldDiversity.R: downgrade growthForm conflict check from stop() to diagnostic-only warning
 
 Follow-up decision to the same-day investigation (prior entry). The 772

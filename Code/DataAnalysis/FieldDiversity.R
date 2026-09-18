@@ -878,7 +878,41 @@ if (length(unmapped_categories) > 0) {
 # NOT fabricate an exposure signal from an unrelated field (cover, height,
 # growth form) just to close the coverage gap.
 # ============================================================================
-vst_nonwoody <- read.csv(vst_nonwoody_path, fileEncoding = "UTF-8-BOM")
+# ---- vst_non-woody.csv: a real run found the SAME base read.csv() quote-
+# balancing failure already fixed for vst_mappingandtagging.csv above --
+# "invalid input found on input connection" / "EOF within quoted string" --
+# silently truncating this file to 13,916 rows against the 76,976 rows
+# NEON_Download_VegStructure.R's own "Wrote ..." message reported at
+# download time. Not caught when the vst_mappingandtagging fix was first
+# applied because vst_non-woody wasn't part of the pipeline yet. Same
+# fingerprint scan (raw line ODD-quote-count) and same fix (switch to
+# readr::read_csv() for this file only) applied here, unchanged from the
+# vst_mappingandtagging approach above.
+nonwoody_raw_lines <- readLines(vst_nonwoody_path, warn = FALSE)
+nonwoody_quote_counts <- lengths(regmatches(nonwoody_raw_lines, gregexpr('"', nonwoody_raw_lines)))
+nonwoody_odd_quote_lines <- which(nonwoody_quote_counts %% 2 == 1)
+if (length(nonwoody_odd_quote_lines) > 0) {
+  cat("\nvst_non-woody.csv: line(s) with an ODD '\"' count (likely source of the CSV-quoting",
+      "parse failure) at line number(s):\n")
+  print(head(nonwoody_odd_quote_lines, 20))
+} else {
+  cat("\nvst_non-woody.csv: no odd-quote-count line found by the raw scan -- the malformed-quote",
+      "diagnosis may not be the exact mechanism here; check the readr::read_csv() problems()",
+      "printout below instead.\n")
+}
+
+vst_nonwoody <- read_csv(vst_nonwoody_path, show_col_types = FALSE, progress = FALSE)
+nonwoody_parse_problems <- problems(vst_nonwoody)
+if (nrow(nonwoody_parse_problems) > 0) {
+  cat("\nvst_non-woody.csv: read_csv() reported", nrow(nonwoody_parse_problems),
+      "parsing problem(s):\n")
+  print(nonwoody_parse_problems)
+}
+cat("\nLoaded", nrow(vst_nonwoody), "rows from vst_non-woody.csv via read_csv() -- compare",
+    "against the row count NEON_Download_VegStructure.R's own \"Wrote ...\" message reported at",
+    "download time (76,976 on the run that surfaced this bug) to confirm the fix worked. If",
+    "this is still far below that, the fix above did not fully resolve it -- investigate",
+    "further rather than assuming success.\n")
 
 cat("\n==== STEP 1C: vst_non-woody structure investigation ====\n")
 cat("vst_non-woody: ", nrow(vst_nonwoody), " rows, columns:\n", sep = "")
@@ -1314,16 +1348,14 @@ if (nrow(no_flight_date) > 0) {
   print(as.data.frame(no_flight_date))
 }
 
-# ---- spot check: one real site-year, tower vs. all, at peak_flight --------
-spot_check_key <- field_diversity_long %>%
-  filter(temporal_scope == "peak_flight") %>%
-  count(tower_id, year) %>% filter(n == 2) %>% slice(1)
-
-if (nrow(spot_check_key) == 0) {
-  cat("\n==== Spot check: no site-year has a peak_flight match for BOTH plot_scope",
-      "values -- nothing to compare side by side. ====\n")
-} else {
-  sc_tid <- spot_check_key$tower_id[1]; sc_yr <- spot_check_key$year[1]
+# ---- spot check: real site-year(s), tower vs. all, at peak_flight --------
+# Generalized into a function taking an explicit (tower_id, year) rather
+# than always running on whichever site-year happened to be found first
+# (which resolved to ABBY 2017 on the one real run so far, showing zero
+# canopy-filter exclusion there) -- one site showing no exclusion doesn't
+# establish whether the filter excludes anything anywhere else across the
+# other site-years in the dataset.
+run_spot_check <- function(sc_tid, sc_yr) {
   cat("\n==== Spot check:", sc_tid, sc_yr, "(temporal_scope = peak_flight) ====\n")
 
   sc_rows <- field_diversity_long %>%
@@ -1366,6 +1398,31 @@ if (nrow(spot_check_key) == 0) {
   if (length(richness_tower) == 1 && length(richness_all) == 1) {
     cat("\nfloristic_richness(all) =", richness_all, ">= floristic_richness(tower) =", richness_tower,
         "->", if (richness_all >= richness_tower) "OK" else "!! VIOLATED", "\n")
+  }
+
+  invisible(sc_rows)
+}
+
+# Eligible site-years: a peak_flight match for BOTH plot_scope values. Runs
+# on up to 4 DISTINCT sites (one row per tower_id, not per tower_id-year) so
+# the canopy filter's effect is checked across multiple sites rather than
+# just the single ABBY 2017 data point.
+spot_check_candidates <- field_diversity_long %>%
+  filter(temporal_scope == "peak_flight") %>%
+  count(tower_id, year) %>%
+  filter(n == 2) %>%
+  distinct(tower_id, .keep_all = TRUE) %>%
+  slice_head(n = 4)
+
+if (nrow(spot_check_candidates) == 0) {
+  cat("\n==== Spot check: no site-year has a peak_flight match for BOTH plot_scope",
+      "values -- nothing to compare side by side. ====\n")
+} else {
+  cat("\n==== Running spot checks on", nrow(spot_check_candidates), "distinct site(s):",
+      paste(spot_check_candidates$tower_id, spot_check_candidates$year, sep = "-", collapse = ", "),
+      "====\n")
+  for (i in seq_len(nrow(spot_check_candidates))) {
+    run_spot_check(spot_check_candidates$tower_id[i], spot_check_candidates$year[i])
   }
 }
 
