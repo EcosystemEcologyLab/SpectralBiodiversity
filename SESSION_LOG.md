@@ -4,6 +4,35 @@ Committed, dated record of work performed in this repository. Reverse
 chronological order, newest entry at the top. See CLAUDE.md for the
 convention this file follows.
 
+## 2026-09-18 00:00 UTC — FieldDiversity.R: added investigation-only diagnostic for the 772 same-date growthForm conflicts (not run, no data in this sandbox)
+
+Requested follow-up to the 2026-09-12 entry: 772 duplicate (individualID,
+date) groups in vst_apparentindividual disagree on growthForm at the SAME
+visit (not across years like the resolved vst_mappingandtagging taxonID
+case), so the most-recent-date rule cannot apply -- no time signal
+separates the rows. Investigation-only per the request: no resolution rule
+proposed or implemented.
+
+Added a temporary diagnostic block (marked INVESTIGATION ONLY, left in
+place following the same convention as the taxonID investigation) inside
+the existing growthForm identity-conflict check, executing before the
+pre-existing stop(). It: (1) writes full-row content (all columns) for a
+sample of ~30 conflicting groups, preferring a mix of exactly-2-row and
+>2-row groups if any exist, to
+./Data/NEON_FieldData/vst_growthform_conflict_sample.csv; (2) checks
+whether canopyPosition ALSO differs within these same groups, or stays
+consistent despite the growthForm split; (3) reports site/plot/date
+clustering of the 772 groups; (4) for 2-row groups, scores how many OTHER
+columns differ between the pair (excluding uid) as a duplicate-typo vs.
+genuinely-distinct-observation heuristic.
+
+NOT RUN: this sandbox has no ./Data/NEON_FieldData/ directory at all (no
+NEON data present, consistent with prior sessions -- see project memory).
+Confirmed the script still parse()s cleanly (Rscript parse() check). The
+actual growthForm value pairs, canopyPosition consistency finding,
+clustering pattern, and duplicate-vs-distinct counts requested by the task
+are unknown until this is run against real data outside this sandbox.
+
 ## 2026-09-12 01:45 UTC — FieldDiversity.R: resolve taxonID conflicts via most-recent-date rule, audit trail, identity check on vst_apparentindividual duplicates
 
 Follow-up to the join fan-out fix (prior entry): the 172 individualIDs found

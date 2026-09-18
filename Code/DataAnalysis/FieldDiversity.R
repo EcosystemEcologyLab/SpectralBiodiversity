@@ -570,6 +570,110 @@ if (nrow(apparent_dupe_visits) == 0) {
     cat("\n!! ", nrow(apparent_identity_conflicts), " duplicate (individualID, date) group(s) in ",
         "vst_apparentindividual disagree on '", growthform_col_apparent, "':\n", sep = "")
     print(head(apparent_identity_conflicts, 10))
+
+    # ---- INVESTIGATION ONLY (temporary diagnostic, left in place per the
+    # convention already used above for the taxonID case) -- NOT a
+    # resolution. A real run found 772 of these same-DATE conflicts. Unlike
+    # the vst_mappingandtagging taxonID case, these disagree within a single
+    # visit, so the most-recent-date rule that resolved that case has no
+    # time signal to work with here. Gathers evidence on the actual pattern
+    # -- full row content for a sample of groups, whether canopyPosition
+    # ALSO disagrees within these same groups (directly relevant to the
+    # any-exposed-individual rule), site/plot/date clustering, and a
+    # duplicate-typo-vs-genuinely-distinct heuristic for 2-row groups --
+    # before any resolution rule is proposed. Stops (below, unchanged) after
+    # reporting, same as before this diagnostic was added.
+    uid_col_apparent <- find_optional_column(vst_apparent, "^uid$")
+    observer_col_apparent <- find_optional_column(vst_apparent, "recordedby")
+    if (is.na(observer_col_apparent)) {
+      observer_col_apparent <- find_optional_column(vst_apparent, "measuredby")
+    }
+    remarks_col_apparent <- find_optional_column(vst_apparent, "^remarks$")
+    cat("[DIAGNOSTIC] Columns located for this pass -- uid:", uid_col_apparent,
+        "| observer:", observer_col_apparent, "| remarks:", remarks_col_apparent, "\n")
+
+    conflict_groups <- apparent_identity_conflicts %>%
+      select(all_of(c(individual_col_apparent, date_col_apparent)), n_growthforms)
+    two_row_groups   <- conflict_groups %>% filter(n_growthforms == 2)
+    multi_row_groups <- conflict_groups %>% filter(n_growthforms > 2)
+    # Prefer a mix of exactly-2-row and >2-row groups if any of the latter
+    # exist, rather than always sampling the first N encountered.
+    sample_groups <- bind_rows(
+      head(two_row_groups, if (nrow(multi_row_groups) > 0) 20 else 30),
+      head(multi_row_groups, 10)
+    )
+    cat("[DIAGNOSTIC] Sampling", nrow(sample_groups), "of", nrow(apparent_identity_conflicts),
+        "conflicting groups (", nrow(multi_row_groups), "group(s) have >2 rows).\n")
+
+    sample_rows <- vst_apparent %>%
+      inner_join(sample_groups %>% select(all_of(c(individual_col_apparent, date_col_apparent))),
+                 by = c(individual_col_apparent, date_col_apparent)) %>%
+      arrange(.data[[individual_col_apparent]], .data[[date_col_apparent]])
+    sample_out_path <- "./Data/NEON_FieldData/vst_growthform_conflict_sample.csv"
+    write.csv(sample_rows, sample_out_path, row.names = FALSE)
+    cat("[DIAGNOSTIC] Full-row sample (all columns) for the", nrow(sample_groups),
+        "sampled groups written to", sample_out_path,
+        "-- inspect manually; not parsed further by this script.\n")
+
+    # Does canopyPosition ALSO differ within these same growthForm-conflict
+    # groups, or does it stay consistent even when growthForm splits?
+    if (!is.na(canopy_col)) {
+      canopy_within_conflicts <- vst_apparent %>%
+        inner_join(conflict_groups %>% select(all_of(c(individual_col_apparent, date_col_apparent))),
+                   by = c(individual_col_apparent, date_col_apparent)) %>%
+        group_by(.data[[individual_col_apparent]], .data[[date_col_apparent]]) %>%
+        summarise(n_canopy = n_distinct(.data[[canopy_col]]), .groups = "drop")
+      n_canopy_also_differs <- sum(canopy_within_conflicts$n_canopy > 1)
+      cat("[DIAGNOSTIC] Of", nrow(canopy_within_conflicts), "growthForm-conflicting groups,",
+          n_canopy_also_differs, "ALSO disagree on canopyPosition; the remaining",
+          nrow(canopy_within_conflicts) - n_canopy_also_differs,
+          "have a single consistent canopyPosition value (or all-NA) despite the growthForm split.\n")
+    } else {
+      cat("[DIAGNOSTIC] No canopyPosition column found -- cannot check consistency.\n")
+    }
+
+    # Site/plot/date clustering of the conflicting groups.
+    cluster_check <- vst_apparent %>%
+      inner_join(conflict_groups %>% select(all_of(c(individual_col_apparent, date_col_apparent))),
+                 by = c(individual_col_apparent, date_col_apparent)) %>%
+      distinct(.data[[individual_col_apparent]], .data[[date_col_apparent]],
+               .data[[site_col_apparent]], .data[[plot_col_apparent]])
+    cat("\n[DIAGNOSTIC] Conflicting-group clustering -- distinct sites:",
+        n_distinct(cluster_check[[site_col_apparent]]), "| distinct plots:",
+        n_distinct(cluster_check[[plot_col_apparent]]), "| distinct dates:",
+        n_distinct(cluster_check[[date_col_apparent]]), "\n")
+    cat("[DIAGNOSTIC] Top 10 sites by conflict-group count:\n")
+    print(cluster_check %>% count(.data[[site_col_apparent]], sort = TRUE,
+                                   name = "n_conflict_groups") %>% head(10))
+    cat("[DIAGNOSTIC] Top 10 (site, date) combinations by conflict-group count:\n")
+    print(cluster_check %>% count(.data[[site_col_apparent]], .data[[date_col_apparent]],
+                                   sort = TRUE, name = "n_conflict_groups") %>% head(10))
+
+    # Duplicate-typo vs. genuinely-distinct heuristic, 2-row groups only: how
+    # many OTHER columns (excluding uid, expected to always differ) differ
+    # between the pair. A group differing only in growthForm reads as a
+    # likely data-entry duplicate; one differing across many fields reads as
+    # two genuinely separate observations sharing an individualID+date.
+    compare_cols <- setdiff(names(vst_apparent), uid_col_apparent[!is.na(uid_col_apparent)])
+    two_row_grouped <- vst_apparent %>%
+      inner_join(two_row_groups %>% select(all_of(c(individual_col_apparent, date_col_apparent))),
+                 by = c(individual_col_apparent, date_col_apparent)) %>%
+      group_by(.data[[individual_col_apparent]], .data[[date_col_apparent]]) %>%
+      filter(n() == 2) %>%
+      group_split()
+    n_cols_differ_vec <- sapply(two_row_grouped, function(grp) {
+      sum(sapply(compare_cols, function(col) length(unique(grp[[col]])) > 1))
+    })
+    cat("\n[DIAGNOSTIC] 2-row conflict groups (n =", length(n_cols_differ_vec),
+        "): distribution of how many columns differ between the pair",
+        "(1 = only growthForm differs):\n")
+    print(table(n_cols_differ_vec))
+    n_duplicate_looking <- sum(n_cols_differ_vec <= 2)
+    cat("[DIAGNOSTIC] Groups differing in <=2 columns (\"duplicate-looking\"):",
+        n_duplicate_looking, "| differing in >2 columns (\"genuinely distinct\"):",
+        length(n_cols_differ_vec) - n_duplicate_looking, "\n")
+    # ---- END INVESTIGATION-ONLY DIAGNOSTIC ---------------------------------
+
     stop(nrow(apparent_identity_conflicts), " duplicate (individualID, date) group(s) in ",
          "vst_apparentindividual disagree on '", growthform_col_apparent, "' -- a genuine ",
          "identity conflict at the SAME visit, not independent multi-year evidence like the ",
