@@ -4,6 +4,69 @@ Committed, dated record of work performed in this repository. Reverse
 chronological order, newest entry at the top. See CLAUDE.md for the
 convention this file follows.
 
+## 2026-09-18 21:00 UTC — CompareSpectralVsFieldDiversity.R: add canopy-filtered comparisons, self-tested on synthetic data (no real data in this sandbox)
+
+Extended `Code/CompareSpectralVsFieldDiversity.R` to compare the spectral
+metrics against BOTH the unfiltered and canopy-filtered floristic metrics
+(`FieldDiversity.R` now produces `floristic_richness_canopy`,
+`floristic_shannon_mean_canopy`, `floristic_shannon_gamma_canopy` alongside
+the originals), and to directly report whether canopy-filtering improves
+rank-order agreement -- the question this comparison has been building
+toward.
+
+The target file did not exist in this repo at the start of this task (no
+commit on any branch had ever added it) -- flagged to the user via
+AskUserQuestion rather than fabricating the base comparison script; the
+user then pushed it (`758e53f`) and this task proceeded against the real
+file.
+
+Changes: (1) `field_resolved`'s peak-flight/per-bout resolution now also
+computes the three `_canopy` columns, same rule as the unfiltered ones; (2)
+`metric_cols` includes the three `_canopy` columns for the per-tower
+averaging step; (3) `richness_pairs`/`diversity_pairs` are each doubled via
+a new `make_canopy_variant()` helper (appends `_canopy` to `field_var`,
+" (canopy)" to `label`, tags `field_type`), so all_pairs now carries 8
+richness + 20 diversity tests (was 4 + 10); (4) new section 7,
+`canopy_filtering_improvement_summary` -- derives `pair_key` by stripping
+the `_canopy` suffix from `field_var`, pivots wide on `field_type` to
+produce `unfiltered_rho`/`canopy_rho`/`unfiltered_tau`/`canopy_tau` per
+(group, pair_key, spectral_var), computes `rho_delta`/`tau_delta`, prints
+sorted by `rho_delta` descending within group, writes
+`canopy_filtering_improvement_summary.csv`. FDR correction logic (section 6)
+is untouched, now just running over more rows per group -- its comments/cat
+text that hardcoded "4 tests"/"10 tests" were corrected to stay accurate
+(text-only, not a logic change).
+
+Found and fixed one thing the doubled tribbles broke: `pmap(make_panel)`
+was passing every tribble column as a named argument, so the new
+`field_type` column would have errored against `make_panel(field_var,
+spectral_var, label)`'s fixed signature -- fixed by `select()`ing just the
+three needed columns before `pmap()`, not by changing `make_panel` itself.
+
+Confirmed the plot/table-figure code needed no other changes to generalize:
+`wrap_plots()` heights and the table figure's `height = 0.5 * nrow(table_df)
++ 2` already scale off `length()`/`nrow()`, not a hardcoded count.
+
+Self-tested end-to-end (this sandbox has `tidyverse`/`patchwork` installed,
+unlike `FieldDiversity.R`'s missing `hillR`, so this could actually be run,
+just not against real data): built synthetic `field_diversity_long.csv` and
+`spectral_diversity_by_year.csv` (12 towers x 3 years) matching the real
+schema, ran the full script against them in a scratch directory. Confirmed:
+script runs to completion with no errors; `rank_order_summary_by_tower.csv`
+has 28 data rows (8 + 20, as expected); `canopy_filtering_improvement_summary.csv`
+has the exact requested columns (`group, pair_key, spectral_var,
+unfiltered_rho, canopy_rho, unfiltered_tau, canopy_tau, rho_delta,
+tau_delta`) and 14 data rows (4 + 10 unique pairs, as expected); all five
+output files (2 CSVs, 3 PNGs) are written successfully with `limitsize =
+FALSE` handling the now-taller stacked plots. Script also confirmed to
+`parse()` cleanly on its own.
+
+NOT verified against real data: this sandbox has no `Data/` directory at
+all, so the actual improvement-summary numbers (whether canopy-filtering
+helps or hurts agreement with any real spectral metric) are unknown until
+run outside this sandbox. Not committed or pushed per the task's explicit
+instruction.
+
 ## 2026-09-18 20:01 UTC — vst_non-woody.csv read fix + multi-site spot check: verified already present, not run (no data/hillR in this sandbox)
 
 Requested task: apply the same `readr::read_csv()` fix already used for

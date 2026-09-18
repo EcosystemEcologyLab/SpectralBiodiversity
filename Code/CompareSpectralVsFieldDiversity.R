@@ -43,9 +43,12 @@ field_resolved <- field %>%
     peak <- filter(.x, temporal_scope == "peak_flight")
     src <- if (nrow(peak) > 0) peak else .x
     tibble(
-      floristic_richness      = mean(src$floristic_richness, na.rm = TRUE),
-      floristic_shannon_mean  = mean(src$floristic_shannon_mean, na.rm = TRUE),
-      floristic_shannon_gamma = mean(src$floristic_shannon_gamma, na.rm = TRUE)
+      floristic_richness             = mean(src$floristic_richness, na.rm = TRUE),
+      floristic_shannon_mean         = mean(src$floristic_shannon_mean, na.rm = TRUE),
+      floristic_shannon_gamma        = mean(src$floristic_shannon_gamma, na.rm = TRUE),
+      floristic_richness_canopy      = mean(src$floristic_richness_canopy, na.rm = TRUE),
+      floristic_shannon_mean_canopy  = mean(src$floristic_shannon_mean_canopy, na.rm = TRUE),
+      floristic_shannon_gamma_canopy = mean(src$floristic_shannon_gamma_canopy, na.rm = TRUE)
     )
   }) %>%
   ungroup()
@@ -67,7 +70,8 @@ metric_cols <- c(
   "spectral_species_richness", "cv", "cha", "chv_standardized",
   "shannon_h", "shannon_effective",
   "raoq_ndvi", "raoq_nirv", "raoq_allbands",
-  "floristic_richness", "floristic_shannon_mean", "floristic_shannon_gamma"
+  "floristic_richness", "floristic_shannon_mean", "floristic_shannon_gamma",
+  "floristic_richness_canopy", "floristic_shannon_mean_canopy", "floristic_shannon_gamma_canopy"
 )
 
 # NOTE on chv_standardized: it's a z-score computed across ALL completed
@@ -92,7 +96,10 @@ if (nrow(joined) < 5) {
 }
 
 # ============================================================================
-# 5. Metric pairs -- SSR only for richness; Shannon + Rao's Q for diversity
+# 5. Metric pairs -- SSR only for richness; Shannon + Rao's Q for diversity.
+#    Each pair is doubled into an "Unfiltered" and a "Canopy-filtered"
+#    variant (field_var + "_canopy", label + " (canopy)") so the two can be
+#    compared directly in the improvement summary below (section 7).
 # ============================================================================
 richness_pairs <- tribble(
   ~field_var,            ~spectral_var,               ~label,
@@ -100,7 +107,8 @@ richness_pairs <- tribble(
   "floristic_richness",  "cv",                         "CV vs. Floristic Richness",
   "floristic_richness",  "cha",                        "CHA vs. Floristic Richness",
   "floristic_richness",  "chv_standardized",           "CHV (standardized) vs. Floristic Richness"
-)
+) %>%
+  mutate(field_type = "Unfiltered")
 
 diversity_pairs <- tribble(
   ~field_var,                 ~spectral_var,       ~label,
@@ -114,7 +122,18 @@ diversity_pairs <- tribble(
   "floristic_shannon_gamma",  "raoq_ndvi",         "Rao's Q (NDVI) vs. Floristic Shannon (gamma)",
   "floristic_shannon_gamma",  "raoq_nirv",         "Rao's Q (NIRv) vs. Floristic Shannon (gamma)",
   "floristic_shannon_gamma",  "raoq_allbands",     "Rao's Q (all-bands) vs. Floristic Shannon (gamma)"
-)
+) %>%
+  mutate(field_type = "Unfiltered")
+
+make_canopy_variant <- function(pairs) {
+  pairs %>%
+    mutate(field_var  = paste0(field_var, "_canopy"),
+           label      = paste0(label, " (canopy)"),
+           field_type = "Canopy-filtered")
+}
+
+richness_pairs  <- bind_rows(richness_pairs,  make_canopy_variant(richness_pairs))
+diversity_pairs <- bind_rows(diversity_pairs, make_canopy_variant(diversity_pairs))
 
 all_pairs <- bind_rows(
   richness_pairs %>% mutate(group = "Richness"),
@@ -146,7 +165,8 @@ results <- all_pairs %>%
   ungroup()
 
 # ---- FDR (Benjamini-Hochberg) correction, applied SEPARATELY WITHIN each
-# group (Richness: 4 tests; Diversity: 10 tests) -- NOT pooled across both.
+# group (Richness, Diversity -- each now covering both the Unfiltered and
+# Canopy-filtered variant of every pair) -- NOT pooled across both.
 # Richness and Diversity are distinct research questions here (different
 # field metric, different spectral metric sets, reported/interpreted
 # separately throughout this analysis), so they shouldn't share one
@@ -170,16 +190,42 @@ results <- results %>%
 
 cat("\n==== Rank-order tests (per-tower averaged, n =", nrow(joined), "towers) ====\n")
 cat("     (rho_p_fdr / tau_p_fdr are Benjamini-Hochberg FDR-corrected WITHIN each\n",
-    "      group separately -- Richness's 4 tests and Diversity's 10 tests are NOT\n",
-    "      pooled together, since they're distinct research questions. Use these,\n",
-    "      not the raw p-values, to judge significance.)\n\n", sep = "")
+    "      group separately -- Richness's and Diversity's tests (each now including both\n",
+    "      Unfiltered and Canopy-filtered variants) are NOT pooled together, since they're\n",
+    "      distinct research questions. Use these, not the raw p-values, to judge significance.)\n\n", sep = "")
 print(results %>% select(group, label, n, rho, rho_p, rho_p_fdr, tau, tau_p, tau_p_fdr), n = Inf)
 
 write_csv(results, file.path(out_dir, "rank_order_summary_by_tower.csv"))
 write_csv(joined, file.path(out_dir, "joined_data_averaged_by_tower.csv"))
 
 # ============================================================================
-# 7. Plots -- one clean, larger panel per pair, stacked
+# 7. Canopy-filtering improvement summary -- does canopy-filtering the field
+#    metric improve rank-order agreement with each spectral metric, relative
+#    to the unfiltered version of the same comparison? pair_key strips the
+#    "_canopy" suffix from field_var so "floristic_richness" and
+#    "floristic_richness_canopy" (and likewise the Shannon mean/gamma
+#    variants) are matched up as the same underlying comparison.
+# ============================================================================
+improvement_summary <- results %>%
+  mutate(pair_key = str_remove(field_var, "_canopy$"),
+         type_key = if_else(field_type == "Unfiltered", "unfiltered", "canopy")) %>%
+  select(group, pair_key, spectral_var, type_key, rho, tau) %>%
+  pivot_wider(names_from = type_key, values_from = c(rho, tau),
+              names_glue = "{type_key}_{.value}") %>%
+  mutate(rho_delta = canopy_rho - unfiltered_rho,
+         tau_delta = canopy_tau - unfiltered_tau) %>%
+  arrange(group, desc(rho_delta))
+
+cat("\n==== Canopy-filtering improvement summary (per group, sorted by rho_delta desc) ====\n")
+cat("     (rho_delta / tau_delta = canopy-filtered stat minus unfiltered stat for the SAME\n",
+    "      field metric vs. spectral metric pair. Positive means canopy-filtering improved\n",
+    "      rank-order agreement with that spectral metric; negative means it hurt.)\n\n", sep = "")
+print(improvement_summary, n = Inf)
+
+write_csv(improvement_summary, file.path(out_dir, "canopy_filtering_improvement_summary.csv"))
+
+# ============================================================================
+# 8. Plots -- one clean, larger panel per pair, stacked
 # ============================================================================
 make_panel <- function(field_var, spectral_var, label) {
   d <- joined %>%
@@ -200,9 +246,11 @@ make_panel <- function(field_var, spectral_var, label) {
 }
 
 richness_plots <- richness_pairs %>%
+  select(field_var, spectral_var, label) %>%
   pmap(make_panel)
 
 diversity_plots <- diversity_pairs %>%
+  select(field_var, spectral_var, label) %>%
   pmap(make_panel)
 
 richness_stack <- wrap_plots(richness_plots, ncol = 1) +
@@ -222,7 +270,7 @@ cat("\nSaved:\n",
     "  - diversity_by_tower.png (tall, one panel per pair)\n", sep = "")
 
 # ============================================================================
-# 8. Table figure: ALL tests, columns grouped by statistic (all rho columns
+# 9. Table figure: ALL tests, columns grouped by statistic (all rho columns
 #    together, then all tau columns together, raw-before-FDR within each),
 #    with FDR-significant cells highlighted independently for rho and tau
 #    (NOT requiring both to agree -- each gets its own flag). A small gap
