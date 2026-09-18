@@ -537,16 +537,38 @@ cat("\nDeduplicated vst_mappingandtagging:", nrow(vst_mapping), "->", nrow(vst_m
 
 # ---- The 38,758 duplicate (individualID, date) pairs found in
 # vst_apparentindividual (see apparent_dupe_visits above) are NOT
-# deduplicated -- repeat-visit structure is preserved. But same-visit
-# duplicates deserve the same identity-conflict check just applied to
-# vst_mappingandtagging: canopyPosition is EXPECTED to vary/disagree
-# between duplicate rows (independent readings, and the any-exposed-
-# individual rule is designed around exactly that), but a disagreement on
-# an identity-relevant field (growthForm) at the SAME visit would mean
-# individualID isn't uniquely identifying at that resolution -- a genuine
-# data-quality concern, not something the any()-based classification can
-# paper over. Flagged the same way as the taxonID conflict (stop(), not a
-# silent resolution) if found.
+# deduplicated -- repeat-visit structure is preserved. Same-visit
+# duplicates were checked against the same identity-conflict question
+# raised for vst_mappingandtagging's taxonID: does growthForm (an
+# identity-relevant field) ever disagree within one (individualID, date)
+# group?
+#
+# INVESTIGATION FINDING (see the diagnostic block below, and the
+# 2026-09-18 SESSION_LOG entries): of 772 such conflicting groups, 673 of
+# 678 two-row groups (99.3%) differ across MANY columns simultaneously
+# (typically 7-11), not just growthForm -- the signature of two genuinely
+# distinct physical observations, most plausibly different stems of a
+# multi-stem individual (a configuration NEON's vst protocol explicitly
+# supports), not a data-entry duplicate. Conflicts cluster strongly by
+# site/visit (e.g. 162 of 772 at ORNL alone), consistent with specific
+# visits recording more multi-stem individuals rather than random
+# corruption. Only 219 of 772 groups (28%) actually disagree on
+# canopyPosition -- the one field the canopy classification logic reads --
+# and canopyPosition disagreement within a duplicate group is already
+# EXPECTED/tolerated by design (independent readings; see above).
+#
+# DECISION: unlike the taxonID case (one tree cannot logically be two
+# species -- a genuine contradiction), one individual CAN legitimately have
+# differing growthForm/stemDiameter/height across stems with no corruption
+# involved. The any-exposed-individual-wins classification rule already
+# tolerates this kind of within-individual heterogeneity by design -- if
+# one stem is sunlit and another shaded, classifying the species as exposed
+# from the sunlit stem is the intended behavior, not a bug. So: NOT
+# resolved, NOT deduplicated -- both rows of a conflicting group remain
+# and contribute independently to the per-species canopy vote, same as any
+# other individual's rows. Downgraded from stop() to a non-blocking
+# diagnostic summary (below) that reports the finding without halting the
+# script.
 growthform_col_apparent <- find_optional_column(vst_apparent, "^growthform$")
 
 if (nrow(apparent_dupe_visits) == 0) {
@@ -571,18 +593,14 @@ if (nrow(apparent_dupe_visits) == 0) {
         "vst_apparentindividual disagree on '", growthform_col_apparent, "':\n", sep = "")
     print(head(apparent_identity_conflicts, 10))
 
-    # ---- INVESTIGATION ONLY (temporary diagnostic, left in place per the
-    # convention already used above for the taxonID case) -- NOT a
-    # resolution. A real run found 772 of these same-DATE conflicts. Unlike
-    # the vst_mappingandtagging taxonID case, these disagree within a single
-    # visit, so the most-recent-date rule that resolved that case has no
-    # time signal to work with here. Gathers evidence on the actual pattern
-    # -- full row content for a sample of groups, whether canopyPosition
-    # ALSO disagrees within these same groups (directly relevant to the
-    # any-exposed-individual rule), site/plot/date clustering, and a
+    # ---- DIAGNOSTIC (left in place; informational only, does not block
+    # execution -- see the decision recorded above). Reports the same
+    # evidence the investigation was based on -- full row content for a
+    # sample of groups, whether canopyPosition ALSO disagrees within these
+    # same groups, site/plot/date clustering, and a
     # duplicate-typo-vs-genuinely-distinct heuristic for 2-row groups --
-    # before any resolution rule is proposed. Stops (below, unchanged) after
-    # reporting, same as before this diagnostic was added.
+    # every time this check runs, so the pattern stays visible on future
+    # data refreshes without re-halting the script.
     uid_col_apparent <- find_optional_column(vst_apparent, "^uid$")
     observer_col_apparent <- find_optional_column(vst_apparent, "recordedby")
     if (is.na(observer_col_apparent)) {
@@ -672,20 +690,30 @@ if (nrow(apparent_dupe_visits) == 0) {
     cat("[DIAGNOSTIC] Groups differing in <=2 columns (\"duplicate-looking\"):",
         n_duplicate_looking, "| differing in >2 columns (\"genuinely distinct\"):",
         length(n_cols_differ_vec) - n_duplicate_looking, "\n")
-    # ---- END INVESTIGATION-ONLY DIAGNOSTIC ---------------------------------
+    # ---- END DIAGNOSTIC -----------------------------------------------------
 
-    stop(nrow(apparent_identity_conflicts), " duplicate (individualID, date) group(s) in ",
-         "vst_apparentindividual disagree on '", growthform_col_apparent, "' -- a genuine ",
-         "identity conflict at the SAME visit, not independent multi-year evidence like the ",
-         "vst_mappingandtagging case. Investigate before trusting the any-exposed-individual ",
-         "classification for these individuals; not resolved automatically.")
+    warning(nrow(apparent_identity_conflicts), " duplicate (individualID, date) group(s) in ",
+            "vst_apparentindividual disagree on '", growthform_col_apparent, "' -- investigated ",
+            "and found to reflect legitimate multi-stem records (differing across many columns, ",
+            "clustered by site/visit, mostly NOT disagreeing on canopyPosition), not data ",
+            "corruption or a taxonID-like identity conflict. NOT resolved, NOT deduplicated -- ",
+            "both rows of each conflicting group remain and flow into the any-exposed-individual",
+            " canopy classification unchanged, which already tolerates this kind of within-",
+            "individual heterogeneity by design. See the [DIAGNOSTIC] output above for the ",
+            "current per-run counts.", call. = FALSE)
+    cat("\nvst_apparentindividual:", nrow(apparent_identity_conflicts), "duplicate",
+        "(individualID, date) group(s) disagree on '", growthform_col_apparent, "' -- treated as",
+        " legitimate multi-stem records per the investigation above, not an identity conflict.",
+        " Rows are NOT deduplicated; both remain and contribute independently to the",
+        " any-exposed-individual canopy vote.\n", sep = "")
+  } else {
+    cat("\nvst_apparentindividual: no duplicate (individualID, date) group disagrees on '",
+        growthform_col_apparent, "' -- the any-exposed-individual canopy classification rule is",
+        " confirmed sufficient without further changes here. Same-visit duplicate rows describe",
+        " the same individual consistently; multiple canopyPosition votes (agreeing or",
+        " disagreeing on EXPOSURE, which is expected to genuinely vary by reading) don't reflect",
+        " an identity problem the way a taxonID mismatch would.\n", sep = "")
   }
-  cat("\nvst_apparentindividual: no duplicate (individualID, date) group disagrees on '",
-      growthform_col_apparent, "' -- the any-exposed-individual canopy classification rule is",
-      " confirmed sufficient without further changes here. Same-visit duplicate rows describe",
-      " the same individual consistently; multiple canopyPosition votes (agreeing or",
-      " disagreeing on EXPOSURE, which is expected to genuinely vary by reading) don't reflect",
-      " an identity problem the way a taxonID mismatch would.\n", sep = "")
 }
 
 # ---- vst_apparentindividual (repeated per-visit measurements, incl.

@@ -4,6 +4,37 @@ Committed, dated record of work performed in this repository. Reverse
 chronological order, newest entry at the top. See CLAUDE.md for the
 convention this file follows.
 
+## 2026-09-18 00:30 UTC — FieldDiversity.R: downgrade growthForm conflict check from stop() to diagnostic-only warning
+
+Follow-up decision to the same-day investigation (prior entry). The 772
+same-date growthForm conflicts in vst_apparentindividual were found NOT to
+be an identity problem like the taxonID case: 673 of 678 two-row groups
+(99.3%) differ across many columns simultaneously (typically 7-11), the
+signature of genuinely distinct observations -- most plausibly different
+stems of a multi-stem individual (supported by NEON's vst protocol), not a
+data-entry duplicate. Conflicts cluster strongly by site/visit (162 of 772
+at ORNL alone). Only 219 of 772 groups (28%) actually disagree on
+canopyPosition, the one field the canopy classification logic reads; the
+any-exposed-individual-wins rule already tolerates this kind of
+within-individual heterogeneity by design.
+
+DECISION: not resolved, not deduplicated. Replaced the hard stop() with a
+non-blocking warning() + cat() summary; all prior [DIAGNOSTIC] output
+(sample CSV write, canopyPosition-agreement count, site/date clustering,
+column-difference distribution) is unchanged and still runs every time.
+Updated the surrounding comment to record the finding and decision. Also
+fixed a latent bug the removal exposed: the closing "no conflicts" message
+previously sat unconditionally after the conflict-check if-block, so once
+stop() no longer aborted execution it would have printed even when 772
+conflicts exist -- moved into an explicit else so each branch reports
+correctly.
+
+Confirmed via diff that only comments/cat()/warning() text changed -- no
+mutate/filter/distinct/slice touched vst_apparent or any downstream table;
+this is a diagnostic-severity change only, no row data transformation.
+Confirmed the script still parse()s cleanly. Not run against real data --
+none present in this sandbox.
+
 ## 2026-09-18 00:00 UTC — FieldDiversity.R: added investigation-only diagnostic for the 772 same-date growthForm conflicts (not run, no data in this sandbox)
 
 Requested follow-up to the 2026-09-12 entry: 772 duplicate (individualID,
