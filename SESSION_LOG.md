@@ -4,6 +4,165 @@ Committed, dated record of work performed in this repository. Reverse
 chronological order, newest entry at the top. See CLAUDE.md for the
 convention this file follows.
 
+## 2026-09-25 19:10 UTC — CompareSpectralVsFieldDiversity.R: split into two independent FDR passes, reorganized outputs to Data/+Figures/, new delta figure
+
+Restructured `Code/CompareSpectralVsFieldDiversity.R`'s rank-order testing
+from one pooled 28-test analysis (unfiltered + canopy-filtered variants
+sharing one Richness/Diversity FDR family each) into two fully independent
+14-test passes -- "all observations" (unfiltered field metrics) and
+"filtered observations" (canopy-filtered field metrics) -- run over the SAME
+tower population, each with its OWN Benjamini-Hochberg correction within its
+own Richness (n=4) and Diversity (n=10) families, never pooled with the
+other pass.
+
+**Mechanics:** `compute_rank_tests()` (per-test Spearman/Kendall logic) and
+the base `richness_pairs`/`diversity_pairs` tribbles are unchanged and
+untouched. New `run_rank_order_pass(richness, diversity, joined)` wraps the
+existing bind-rows-then-group_by(group)-then-BH-correct block (also
+unchanged) and is called twice: once on the base pairs
+(`results_all`), once on `make_canopy_variant(...)`-derived pairs
+(`results_filtered`, reusing that existing helper, just no longer merged
+back into one shared table). `improvement_summary`'s pivot/delta logic
+(section 7) is byte-for-byte the same as before -- only its input changed,
+from one pooled table to `bind_rows(results_all, results_filtered)` -- so
+`rho_delta`/`tau_delta` are numerically IDENTICAL to what the old pooled
+design would have produced (compute_rank_tests() output doesn't depend on
+which FDR family a test lands in; only the `*_p_fdr` columns, unused in the
+delta, differ between designs).
+
+**Why the FDR values differ in principle:** BH-adjusts each raw p by
+`p * m / rank` (then a running min) within its family, where `m` is the
+family size. The old design's Richness family had m=8 (4 unfiltered + 4
+canopy tests sharing rank order); each new pass's Richness family has m=4.
+Halving m roughly halves the multiplier at the same rank, so raw p-values
+that were identical between designs generally land on different (usually
+less conservative) adjusted p-values post-restructure -- confirmed
+numerically in this session's synthetic self-test (see below), not just
+asserted.
+
+**Two table figures:** the single-pass table-rendering code (section 9) was
+refactored into `make_table_figure(results_df, title_txt, fdr_alpha)`,
+called once per pass -- `rank_order_table_all_observations.png` and
+`rank_order_table_filtered_observations.png`, titles distinguishing "All
+Observations" vs. "Canopy-Filtered Observations". No plotting logic was
+duplicated; both figures come from the same function.
+
+**New summary figure:** `canopy_filtering_rho_delta_summary.png` -- a
+horizontal bar chart of `rho_delta` straight from `improvement_summary`
+(section 7's existing column, not recomputed), one bar per spectral metric
+(Diversity's two field variants -- mean/gamma -- disambiguated in the bar
+label since they can carry different deltas), colored by group, sorted
+descending, subtitle states positive=improved/negative=hurt.
+
+**Output reorganization:** `out_dir <- "."` replaced with `data_dir <-
+"./Data"` / `fig_dir <- "./Figures"` (each `dir.create(recursive = TRUE,
+showWarnings = FALSE)`, matching this repo's existing convention e.g.
+`NEON_Download_Hyperspec.R`). Every `write_csv()`/`ggsave()` call updated;
+confirmed via `grep` that no `out_dir` reference remains and no script
+output lands at the working-directory root. `rank_order_summary_by_tower.csv`
+is now two files (`_all_observations.csv` / `_filtered_observations.csv`);
+`canopy_filtering_improvement_summary.csv` keeps its name, just moved into
+`Data/`. Input paths (`field_csv`, `spectral_csv`) were left untouched --
+only outputs were in scope.
+
+**Two rendering bugs found and fixed while visually checking the new
+figures (not previously visible, since the original single-pass table
+figure had never been actually opened for a visual check in prior
+sessions):** (1) with `facet_grid` + a wide row-label column, ggplot only
+gives the title/subtitle the panel's own width, not the full device width
+-- an unwrapped long title/subtitle ran off the right edge of the PNG.
+Fixed with `str_wrap()` on both the table-figure title and the new summary
+figure's subtitle. (2) `theme_minimal()` doesn't set an opaque
+`plot.background`, so every `ggsave()` in this script was writing a
+**transparent-background PNG** (confirmed via `png::readPNG` -- corner alpha
+= 0) -- invisible/unreadable text against a dark viewer background. Fixed
+by adding `bg = "white"` to all five `ggsave()` calls in this script
+(confirmed corner alpha = 1 after the fix). Neither bug is specific to the
+restructuring -- both would have affected the original single-pass table
+figure too -- but both are now fixed everywhere this script writes a PNG.
+The filtered-pass table figure also needed a wider canvas than the
+all-observations one (15in vs. 13in) since its row labels carry an extra
+" (canopy)" suffix that was crowding the rho/tau column headers together.
+
+**Self-tested end-to-end** (synthetic 12-tower/3-year harness in scratch,
+mirroring `Code/`+`Data/NEON_FieldData/` layout plus a root-level
+`spectral_diversity_by_year.csv`, matching `field_csv`/`spectral_csv`'s
+real relative paths): script ran to completion with no errors across five
+consecutive re-runs (each fixing one rendering issue above). Verified: 14
+rows in each of `results_all`/`results_filtered` (not 28 pooled); FDR
+columns visibly differ between the two passes for the same raw p-values
+(e.g. Richness's SSR test: `rho_p_fdr` = 0.00135 in the all-observations
+pass's 4-test family); `improvement_summary` still 14 rows exactly as
+before; all 4 CSVs landed in `Data/`, all 5 PNGs in `Figures/`, nothing new
+at the working-directory root (checked via `ls`); all three new/changed
+figures visually confirmed legible (opaque white background, full titles,
+no column overlap) after the two fixes above; script confirmed to `parse()`
+cleanly (60 top-level expressions).
+
+**Could not verify against real data or the current real tower count:**
+this sandbox still has no `Data/` directory, no real
+`field_diversity_long.csv`, and no real `spectral_diversity_by_year.csv`
+anywhere on the filesystem (`find /` came up empty for both) -- the same
+blocker as every prior session touching this script. Whether the real
+current run reflects 44 towers (vs. the stale n=39 the task mentioned) is
+unverifiable from this sandbox; this will only be known once the script is
+actually run outside it. `Code/CanopyDeltaByEcosystem.R`'s
+`import_functions_from()` import of `field_csv`/`field`/`field_resolved`
+was re-checked against the new file and still resolves correctly (those
+three bindings are unchanged). Not committed or pushed, per the task's
+explicit instruction.
+
+## 2026-09-25 19:00 UTC — CanopyDeltaByEcosystem.R re-verification: task already completed 2026-09-18, no repo state changed
+
+Received a request to build `Code/CanopyDeltaByEcosystem.R` (per-tower
+canopy-filtering delta by IGBP ecosystem, two bar-chart PNGs) that is, item
+for item, the same task already completed and committed in the 2026-09-18
+21:31 UTC entry (`cb876c4`). Checked before redoing any of it: sandbox state
+is unchanged since then — no `Data/` directory, no real
+`Data/NEONsites.csv`, no real `Data/NEON_FieldData/field_diversity_long.csv`
+anywhere on this filesystem (`find /` came up empty for both), and
+`Code/CompareSpectralVsFieldDiversity.R` is unchanged (still `2a720fa`, no
+commits since). So did not rewrite the script — instead re-verified the
+existing one still satisfies every requirement and still runs correctly,
+and used the opportunity to strengthen one finding with genuinely real data.
+
+**Re-ran the synthetic self-test** (fresh 15-tower harness in scratch,
+mirroring `Code/`+`Data/` layout, with a deliberate zero-richness tower and
+a deliberate ecosystem-unmatched tower): script ran end-to-end with no
+errors. Confirmed again: `import_functions_from()` pulls `field_csv` →
+`field` → `field_resolved` verbatim from `CompareSpectralVsFieldDiversity.R`
+(30 tower-years in, 15 tower-averages out — reused, not reimplemented); the
+zero-richness tower produced `pct_filtered = NA` (not Inf/crash) and a blank
+bar label; the two unmatched towers were labeled `"Unknown"` and reported to
+console, not dropped; all 15 towers appear in both bar charts including the
+two zero-delta ones (`CPER`, the zero-richness tower); both PNGs and
+`canopy_delta_by_tower.csv` were written and visually confirmed readable
+(sorted descending, rotated tower labels, `pct_filtered` annotated only on
+the richness figure, blank for the 0% bars, clear ecosystem legend).
+
+**Strengthened the Veg Type finding with real (not synthetic) data:** the
+repo-root file `NEONsites_Footprints.csv` (untracked, 45 rows) is still the
+only real candidate on this filesystem for a "NEONsites.csv"-shaped source
+— read it directly this session and confirmed again, against the real file
+rather than a synthetic stand-in: `Veg.Type` holds 3-letter IGBP
+abbreviations only, observed values `CRO, CVM, DBF, EBF, ENF, GRA, MF, OSH,
+SAV, WET` (10 of the standard 17), all present in the script's `igbp_legend`
+(no `stop()` triggered). This is the same conclusion the 2026-09-18 entry
+reached, now double-confirmed directly rather than inferred. Still
+unresolved, same caveat as before: the script points at
+`./Data/NEONsites.csv` (matching `FieldDiversity.R`'s own `site_xwalk`
+convention), which does not exist here — whether the real
+`Data/NEONsites.csv` is this same file under a different name/location, or a
+distinct file with possibly different values, remains unconfirmed.
+
+**Still not run against real field data** — same blocker as 2026-09-18,
+unchanged: no `Data/NEON_FieldData/field_diversity_long.csv` in this
+sandbox, so the actual per-tower deltas and whether the effect really
+concentrates in GRSM/UNDE/HARV-type forest sites remain unknown until this
+runs outside this sandbox. `Code/CanopyDeltaByEcosystem.R` itself needed no
+code changes this session (already committed, `cb876c4`). This log entry is
+not committed or pushed, per the task's explicit instruction.
+
 ## 2026-09-18 21:31 UTC — New Code/CanopyDeltaByEcosystem.R: canopy-filter delta by tower/ecosystem, self-tested on synthetic data
 
 New script (not modifying `CompareSpectralVsFieldDiversity.R`) answering
