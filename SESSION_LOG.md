@@ -4,6 +4,95 @@ Committed, dated record of work performed in this repository. Reverse
 chronological order, newest entry at the top. See CLAUDE.md for the
 convention this file follows.
 
+## 2026-09-25 19:30 UTC — New Code/DataAnalysis/ComputeAnnualLUE.R: MODIS fPAR x annual AmeriFlux LUE, self-tested on synthetic data
+
+New standalone script computing a third, independent annual LUE estimate --
+real downloaded MODIS MOD15A2H fPAR (8-day composites) joined against real
+annual-resolution AmeriFlux (YY) flux data -- alongside the existing
+NDVI-derived estimates in `ComputeLUE.R` (half-hourly regression) and
+`ComputeLUE_Annual.R` (annual ratio). Neither of those scripts, nor
+`ExtractMODIS.R`, was modified.
+
+**MODIS data:** this sandbox has no `Data/` directory at all (confirmed via
+`find /`), so the real
+`Data/MODIS/4f0a5de4-0053-433c-87ab-33fc5fd3aadc/NEON-MODIS-2013-2021-MOD15A2H-061-results.csv`
+described in the task could not be directly re-inspected this session --
+its structure (columns, the 255.00 fill sentinel, the four QC description
+strings, no x0.01 scale factor) is taken as given, per the task's own
+direct-inspection report, and used as-is: no scale factor applied, QC
+filtering uses `MOD15A2H_061_FparLai_QC_MODLAND_Description`/
+`..._CloudState_Description` directly (no bit decoding), and any
+`Fpar_500m > 1` is excluded via `fpar_valid_range <- c(0, 1)` (catches the
+255.00 fill trap regardless of what its QC descriptions say -- confirmed
+necessary via the synthetic self-test, see below).
+
+**Cloud-state judgment call:** `include_undefined_cloud_state <- FALSE` --
+"Cloud state not defined, assumed clear" composites are EXCLUDED by
+default (conservative: an assumed-clear pixel is a weaker guarantee than a
+confirmed-clear one). One named, clearly-commented constant; flip to `TRUE`
+to include them instead.
+
+**AmeriFlux annual schema (task step 3):** this sandbox also has no
+`Data/NEON_Ameriflux/AnnualData/` -- the real column names could not be
+printed from an actual file this session either. However, real, working
+evidence for the schema already exists elsewhere in this repo:
+`Code/NEON_FluxVariability.R` contains genuine, currently-functioning
+column-selection code reading this exact directory today: `year =
+TIMESTAMP, NEE = NEE_VUT_REF, GPP = GPP_NT_VUT_REF, RECO = RECO_NT_VUT_REF,
+ET = LE_F_MDS` (latent heat, W/m2, converted via `* 0.0864 / 2.45 *
+365.25`). This is direct repo evidence, not a guess -- but the new script
+does NOT simply trust it blindly: Section 2 still reads the first real
+annual file at RUNTIME, `cat()`s its actual `names()`/`head()`, and
+`stop()`s with the real column list visible if `TIMESTAMP`/`GPP_NT_VUT_REF`
+aren't there -- confirmed this guard actually fires (not just theoretically
+present) by re-running against a deliberately wrong-schema synthetic file
+(see VALIDATION below). PAR-equivalent resolution (`PPFD_IN` first,
+`SW_IN_F`/`SW_IN` with the 2.02 factor as fallback) and annual flux loading
+are REUSED via `import_functions_from()` from `ComputeLUE_Annual.R`
+(`resolve_par_column()`, `load_annual_flux_data()`), not reimplemented. ET
+resolution (`resolve_et_column()`) is new -- no such function existed
+anywhere to import -- but uses the EXACT SAME LE->ET conversion factor as
+`NEON_FluxVariability.R` (`0.0864 / 2.45 * 365.25`), and checks for a
+literal `ET`/`ET_F_MDS` column first before falling back to that
+conversion.
+
+**Output:** one row per tower-year to `./Data/lue_by_tower_year.csv`
+(`tower_id, year, fpar_annual, n_fpar_obs_used, n_fpar_obs_total,
+gpp_annual, reco_annual, et_annual, nee_annual, par_annual, lue_annual,
+status`), joined via `full_join` (a tower-year present on only one side is
+kept and flagged, never silently dropped). `status` is one of `"ok"`,
+`"missing fpar data"`, `"missing flux data"`, `"divide by zero"` --
+precedence (fpar checked before flux when both are missing) is a documented
+arbitrary tie-break, not a priority judgment; RECO/ET/NEE are reference
+columns only and never affect `status`.
+
+**Self-tested end-to-end** (synthetic fixtures in scratch, mirroring both
+the real MODIS structure described in the task -- including literal 255.00
+fill rows and all four QC description strings -- and the real AmeriFlux
+annual schema confirmed above): 3 towers with both flux and MODIS data, 1
+MODIS-only tower (`US-xDD`), 1 flux-only tower (`US-xEE`), one deliberate
+`-9999` GPP fill (`US-xCC` 2020), one deliberately forced `fpar_annual ==
+0` (`US-xBB` 2021). Result: all 4 status values produced correctly and with
+the exact expected counts (7 ok / 4 missing flux data / 2 missing fpar data
+/ 1 divide by zero, out of 14 tower-years) -- confirmed by hand-checking
+which synthetic rows should land in each bucket, not just that the script
+ran without erroring. 552 MODIS rows -> 308 passed QC, 31 excluded via the
+`fpar_valid_range` fill-value guard (all 31 were the deliberately-injected
+255.00 rows, confirming that guard -- not the QC description filter --is
+what catches them, matching the task's stated fact that AppEEARS leaves the
+sentinel unconverted regardless of QC labeling). Both runtime schema guards
+confirmed to actually `stop()` (not just silently proceed) when tested
+against a deliberately wrong-column AmeriFlux file and a deliberately
+wrong-column MODIS file, each printing the real columns found before
+stopping. Script confirmed to `parse()` cleanly (69 top-level expressions).
+
+**Could not verify against real data:** as with every prior session
+touching this repo's `Data/` directory, this sandbox has none -- the real
+tower-year counts, real status-value breakdown, and whether the real
+AmeriFlux annual schema actually matches `NEON_FluxVariability.R`'s
+evidence are all unverified until this runs outside this sandbox. Not
+committed or pushed, per the task's explicit instruction.
+
 ## 2026-09-25 19:10 UTC — CompareSpectralVsFieldDiversity.R: split into two independent FDR passes, reorganized outputs to Data/+Figures/, new delta figure
 
 Restructured `Code/CompareSpectralVsFieldDiversity.R`'s rank-order testing
