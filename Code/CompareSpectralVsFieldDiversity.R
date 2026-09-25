@@ -368,10 +368,10 @@ make_table_figure <- function(results_df, title_txt, fdr_alpha = 0.05) {
       column = factor(column, levels = col_order, labels = col_labels),
       is_fdr_col = column %in% c("rho p (FDR)", "tau p (FDR)"),
       is_sig = case_when(
-        column == "rho p (FDR)" ~ rho_fdr_sig,
-        column == "tau p (FDR)" ~ tau_fdr_sig,
+        column == "rho" ~ rho_fdr_sig,
+        column == "tau" ~ tau_fdr_sig,
         TRUE ~ FALSE
-      )
+        )
     )
 
   ggplot(cell_long, aes(x = column, y = row_label)) +
