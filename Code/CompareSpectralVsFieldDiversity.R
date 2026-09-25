@@ -29,7 +29,7 @@ library(tidyverse)
 library(patchwork)
 
 # ---- file paths -- EDIT if your paths differ ----
-field_csv    <- "./Data/NEON_FieldData/field_diversity_long.csv"
+field_csv <- "./Data/field_diversity_long.csv"
 spectral_csv <- "spectral_diversity_by_year.csv"
 data_dir     <- "./Data"      # CSV outputs
 fig_dir      <- "./Figures"   # PNG outputs
