@@ -4,6 +4,96 @@ Committed, dated record of work performed in this repository. Reverse
 chronological order, newest entry at the top. See CLAUDE.md for the
 convention this file follows.
 
+## 2026-10-09 21:40 UTC — Ported Code/DataAnalysis/RaoQYearVariability.R to project conventions, validated on synthetic data
+
+User supplied an existing script (year-to-year variability in Rao's Q across
+NEON sites: two-way ANOVA, within-site permutation test, and a mixed-model LRT,
+all site-adjusted) written for a different sandbox, and asked for it to be
+adapted to run on their server from the project root without changing the
+statistical methodology. Saved to `Code/DataAnalysis/RaoQYearVariability.R`
+(not committed, left in the working tree per instruction).
+
+**Changes made:**
+- Removed a stray `read.csv(...)` line that preceded the shebang in the
+  original.
+- Default input is now `./Data/spectral_diversity_by_year.csv`; output split
+  into `data_dir` (default `./Data`, for the two result CSVs) and `fig_dir`
+  (default `./Figures`, for all PNGs), both overridable via
+  `args[1]`/`args[2]`/`args[3]` and created with
+  `dir.create(..., showWarnings = FALSE, recursive = TRUE)`.
+- Added input validation before analysis: stops with the actual column names
+  printed if `neon_site`/`year`/`raoq_nirv`/`raoq_allbands` are missing;
+  detects a `status`/`ok`/`error` column if present (prints a table of its
+  values and filters to successful rows), otherwise prints a message and
+  proceeds unfiltered -- no column name is assumed silently; stops and prints
+  the offending rows on any duplicate `neon_site` x `year` pair; prints n
+  site-years, n sites, and year range after filtering.
+- Added a top-of-script dependency check (`lme4`, `patchwork`, `readr`,
+  `dplyr`, `tidyr`, `ggplot2`) that installs any missing package from CRAN
+  quietly before `library()` calls.
+- Made the two deprecated ggplot2 arguments version-robust by branching on
+  `packageVersion("ggplot2") >= "3.5.0"`: `legend.position = "inside"` +
+  `legend.position.inside = c(0.85, 0.85)` on >=3.5.0, the old
+  `legend.position = c(0.85, 0.85)` below that; `annotate("label", ...,
+  linewidth = ...)` on >=3.5.0, `label.size = ...` below that.
+- Performance: `year_F()` used to rebuild `model.matrix()` (and refit via
+  `lm.fit`) from scratch inside every one of the 5000 permutations even though
+  the design matrices `Xr`/`Xf` and their ranks/dfs never change -- only `y` is
+  permuted. Replaced with `year_F_prep()` (built once per metric) +
+  `year_F_fast(y, prep)` (two `lm.fit` calls per permutation, reusing the
+  precomputed matrices/df1/df2). `set.seed(42)` and `n_perm = 5000` unchanged.
+- Robustness: `lmer` fits now go through `safe_lmer()`, which prints any
+  singular-fit/convergence warning tagged with the metric and model name via
+  `withCallingHandlers()` + `invokeRestart("muffleWarning")` instead of
+  letting it propagate, so a singular fit doesn't abort the run. The main
+  per-metric analysis loop is wrapped in `tryCatch()`; on failure it prints the
+  error and `quit(status = 1)`.
+
+**Validation (synthetic data only -- no access to the real CSV):**
+- Generated a synthetic CSV with the real column names: 40 sites, years
+  2013-2021, unbalanced (1-9 years/site), a true site effect (sd 2) and a
+  small year effect (-0.15 to 0.15 across years), 3 injected NA values, and a
+  `status` column (success/failed, ~8% failed).
+- Ran end-to-end via `Rscript Code/DataAnalysis/RaoQYearVariability.R` from
+  the repo root: status table printed and filtered to 172/186 success rows;
+  post-filter summary printed 172 site-years / 40 sites / 2013-2021 (dropped
+  to 165-166 obs and 34 sites per metric after the `>= 2 years` per-site
+  filter inside `analyse()` -- expected, not a bug); the two result CSVs
+  landed in `Data/`, all three PNGs in `Figures/`; re-ran capturing stderr
+  only and confirmed zero warnings (deprecated-arg or otherwise) on the
+  installed `ggplot2` 3.4.4 / `lme4` 1.1.35.1.
+- Confirmed the two validation checks fire correctly: a copy of the synthetic
+  CSV with `raoq_allbands` dropped stopped with the missing-column message
+  and the actual column list, exit code 1; a copy with one duplicated
+  `neon_site`/`year` row stopped with the offending rows printed, exit code 1.
+- Compared the optimized `year_F_fast()` against the original `year_F()` on
+  the same synthetic data: observed F identical (`6.237748` both,
+  `identical() == TRUE`) and 0/200 mismatches across permuted `y` vectors
+  (`all.equal` on each).
+- Forced a singular-fit `lmer` warning on degenerate synthetic data and
+  confirmed `safe_lmer()` prints it tagged with the metric/model name and
+  returns the fit rather than aborting.
+- Deleted the synthetic CSV, both result CSVs, and all three generated PNGs
+  from `Data/`/`Figures/` afterward (including the now-empty `Data/` dir) so
+  nothing synthetic persists in tracked output locations.
+
+**Unverified / remains to check against the real data:**
+- The real file's actual column names and whether a status/success column
+  exists at all, and if so what it's called and what its success-indicating
+  values are (`safe` filter logic here only recognizes `status`/`ok` with
+  values in `{"success","ok","TRUE",TRUE,1}`, or `error` treated as
+  "blank/NA means success" -- this guess was never checked against the real
+  schema).
+- Whether the real ~182 expected successful site-years, number of distinct
+  sites, and year range actually match what the validation-check print
+  reports once pointed at the real file.
+- Whether any lmer fit on the real data triggers a singular-fit warning in
+  practice (synthetic test only forced one on deliberately degenerate data),
+  and if so whether that changes how much weight to put on `p_lmm`/`ICC_site`.
+- All numeric results (F statistics, p-values, variance partition, CV) on
+  real data -- only reproducibility of the refactor and the validation
+  scaffolding were checked here, not scientific conclusions.
+
 ## 2026-09-25 19:30 UTC — New Code/DataAnalysis/ComputeAnnualLUE.R: MODIS fPAR x annual AmeriFlux LUE, self-tested on synthetic data
 
 New standalone script computing a third, independent annual LUE estimate --
