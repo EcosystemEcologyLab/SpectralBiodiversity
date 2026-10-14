@@ -4,6 +4,141 @@ Committed, dated record of work performed in this repository. Reverse
 chronological order, newest entry at the top. See CLAUDE.md for the
 convention this file follows.
 
+## 2026-10-14 18:20 UTC — Rewrote Code/DataAnalysis/RaoQYearVariability.R: 7-metric ecosystem CV analysis, validated on synthetic data
+
+User asked for a full rewrite (not just a port) of
+`Code/DataAnalysis/RaoQYearVariability.R`: drop the permutation test/LMM/ICC
+machinery and the single-pair-of-metrics scope, and instead compute per-site
+temporal CV% across all 7 spectral diversity metrics, bin sites into 5 IGBP
+ecosystem groups, and produce three new figures. Not committed, left in the
+working tree per instruction. As in the prior session, the "ORIGINAL SCRIPT"
+section of the request came through as an unfilled placeholder; the rewrite
+was built directly on the already-committed, already-server-adapted version
+of the file (commit `934f4da`) plus evidence read from three other repo
+scripts (see below) rather than blocking on a paste that wasn't arriving.
+
+**Column mapping (Section 2 of the request) -- evidence:**
+All 7 metric columns and the join keys were confirmed against
+`Code/AnnualSpectralDiversity.R`'s `results` tibble definition (~line 966) and
+the row it actually writes to `spectral_diversity_by_year.csv` (~line 1040):
+
+| Requested metric | Column | Evidence |
+|---|---|---|
+| Rao's Q (NIRv) | `raoq_nirv` | AnnualSpectralDiversity.R:972,1045 |
+| Rao's Q (all bands) | `raoq_allbands` | AnnualSpectralDiversity.R:972,1045 |
+| Spectral Shannon H' | `shannon_h` | AnnualSpectralDiversity.R:969,1042 |
+| CHA | `cha` | AnnualSpectralDiversity.R:968,1041 |
+| CHV | `chv` (NOT `chv_standardized`) | AnnualSpectralDiversity.R:968,1041; `chv_standardized` is a global z-score used only for cross-metric correlation in CompareSpectralVsFieldDiversity.R:92-96, not a natural per-site-year CV input |
+| CV | `cv` | AnnualSpectralDiversity.R:968,1041 |
+| SSR | `spectral_species_richness` (NOT `ssr_mean_winning_c`/`ssr_max_winning_c`/`n_reps_gap_check_triggered`, which are per-rep diagnostics) | AnnualSpectralDiversity.R:969-971,1042-1044 |
+
+The join key for ecosystem matching (`tower_id`) was added to the script's
+required-columns list; `AnnualSpectralDiversity.R`'s output includes both
+`tower_id` and `neon_site`, but this was never confirmed against the real
+on-disk file -- flagged as an assumption below.
+
+**Ecosystem mapping (Section 3) -- evidence:**
+`Code/CanopyDeltaByEcosystem.R` (lines 25-36, 93-189) is the script that
+already joins spectral/field data to IGBP ecosystem type; it (a) joins on
+`tower_id = Site.ID` (not the 4-letter `neon_site` code), (b) reads the Veg
+Type column by regex (`/veg.?type/i`) rather than assuming a column name, and
+(c) stops loudly on any unrecognized IGBP code rather than dropping it. The
+rewrite follows this same pattern. `Data/NEONsites.csv` does not currently
+exist in this sandbox (only `NEONsites_Footprints.csv` at the repo root does,
+and it has a `Veg Type` column with standard 3-letter IGBP codes), so the
+script's file-selection logic (try `./Data/NEONsites.csv` first, fall back to
+`./NEONsites_Footprints.csv`) was exercised on the fallback path only.
+
+**Changes made:**
+- Removed the permutation test, LMM/ICC, variance-partition panel, year-
+  trajectory line plots, and the composite summary figure entirely -- none of
+  that code remains. `lme4` dropped from dependencies; `ggrepel` and
+  `patchwork` added (patchwork is still needed: Figure 3's two panels each
+  need an independently computed site order, which a single shared
+  `facet_wrap` axis can't express).
+- Input validation extended: required columns now include all 7 metric
+  columns plus `tower_id`/`neon_site`/`year`; status-column detection,
+  duplicate-row stop(), and the n-site-years/n-sites/year-range print are
+  unchanged in spirit from the prior version.
+- Ecosystem join: tries `./Data/NEONsites.csv` then `./NEONsites_Footprints.csv`,
+  uses whichever has exactly one Veg-Type-like column, reports which it used.
+  Stops if an IGBP code isn't in the Forest(DBF/EBF/ENF/MF)/Grassland(GRA)/
+  Shrub-Savanna(OSH/SAV)/Cropland-Mosaic(CRO/CVM)/Wetland(WET) mapping.
+  Sites with no ecosystem match are reported (not dropped) and kept in
+  Figure 1 but excluded from the ecosystem-binned Figures 2/3.
+- Per-site temporal CV% (sites with >=3 non-NA years) written to
+  `spectral_site_temporal_cv.csv`; a CV guard (`|mean| < 1e-8` or non-finite
+  CV) sets `cv_pct` to NA and reports the count per metric.
+- Figure 1 (`spectral_cv_by_method.png`): one box per metric in the fixed
+  order Rao's Q NIRv / Rao's Q all bands / Shannon H' / CHA / CHV / CV / SSR,
+  jittered site points, `ggrepel`-labeled whisker outliers, console-printed
+  min/median/max/n per method, log10 y-axis only if max/min positive CV > 50x
+  (did not trigger on synthetic data; reported either way).
+- Year-effect two-way ANOVA (`y ~ site + factor(year)`) run per Rao's-Q-metric
+  x ecosystem-bin on site-year values (sites with >=2 years within the bin;
+  bin needs >=3 sites and >=2 distinct years, else status "n/a"); BH FDR
+  applied within each metric across its own testable bins only, written to
+  `raoq_year_anova_by_ecosystem.csv` with stars derived from FDR p.
+- Figure 2 (`raoq_cv_by_ecosystem.png`): two facets (Rao's Q NIRv / all
+  bands), x = ecosystem bin, jittered per-site CV points, "n = " under each
+  box, FDR stars above each box, caption describing both.
+- Figure 3 (`raoq_cv_by_site.png`): two stacked panels (one per Rao's Q
+  metric), sites ordered by ecosystem bin then descending CV within bin,
+  fill = ecosystem bin with a palette shared with Figure 2.
+
+**Validation (synthetic data only -- no access to the real CSV or the real
+ecosystem file):**
+- Built a synthetic `spectral_diversity_by_year.csv` (40 sites across all 5
+  bins + 1 site with no ecosystem match, years 2013-2021, 1-9 years/site,
+  4 injected NAs, a `status` column with 5 failed rows, and `cha` forced to
+  near-zero noise for 3 sites to exercise the CV guard) and a synthetic
+  `NEONsites_Footprints.csv` with matching `Site ID`/`Veg Type` columns.
+- Ran end-to-end via `Rscript Code/DataAnalysis/RaoQYearVariability.R` from
+  the repo root: 194/199 rows passed the status filter (194 site-years, 41
+  sites, 2013-2021); all three CSVs landed in `Data/`, all three PNGs in
+  `Figures/`; zero warnings on the installed ggplot2 3.4.4; the CV guard
+  correctly flagged 3 `cha` sites; the 1 unmatched site was reported and
+  excluded from Figures 2/3 only.
+- Confirmed all four fail-loud paths: a copy missing `raoq_allbands` stopped
+  with the real column list (exit 1); a copy with one duplicated
+  `neon_site`/`year` row stopped with the offending rows printed (exit 1); a
+  sites file with an unmapped IGBP code (`WSA`) stopped listing the code
+  (exit 1); a sites file with Wetland thinned to 2 sites produced status
+  "n/a" (not a false test result) for both Wetland rows in the ANOVA output.
+- Cross-checked the script's `raoq_nirv` x Forest ANOVA row (F=1.017990...,
+  df1=8, df2=20, p=0.454214...) against a standalone
+  `anova(lm(y ~ site + factor(year)))` call on the same filtered data --
+  identical to all printed digits.
+- Visually inspected all three PNGs (labels legible, stars visible, bars
+  correctly grouped/colored/ordered by ecosystem bin, no overlap).
+- Deleted the synthetic spectral CSV, synthetic sites CSV, all three
+  generated result CSVs, and all three generated PNGs afterward (restored
+  the original `NEONsites_Footprints.csv` from a backup); confirmed via
+  `git status` that nothing synthetic persists and the repo's real
+  `NEONsites_Footprints.csv` is byte-identical to before.
+
+**Unverified / remains to check against the real data:**
+- The real file's actual column names, in particular whether `tower_id` is
+  present at all (added as a new required column for the ecosystem join;
+  never confirmed against the real on-disk CSV) and whether `chv` vs.
+  `chv_standardized` is really the intended CHV value for this analysis.
+- Whether a status/success column exists in the real file and what it's
+  called / which values mean success (same caveat as the prior session).
+- Whether `Data/NEONsites.csv` exists on the real server (it doesn't in this
+  sandbox) and, if so, whether its Veg Type values are standard 3-letter IGBP
+  codes or something else -- the unmapped-code stop() will fire loudly if not,
+  but this was only exercised against a synthetic file built to match the
+  expected format.
+- Real bin sizes -- whether any of the 5 ecosystem bins actually has fewer
+  than 3 sites on the real network (triggering "n/a" for that bin, which is
+  by design but changes what Figure 2/the ANOVA table can show).
+- Whether the ~50x log10-axis threshold for Figure 1 is the right call on
+  real CV magnitudes (never triggered on synthetic data, so the log-axis
+  branch itself was only validated for correctness, not for how it looks).
+- All real numeric results (CV%, F/p values, which bins are FDR-significant)
+  -- only the refactor's mechanics and validation scaffolding were checked
+  here, not scientific conclusions.
+
 ## 2026-10-09 21:40 UTC — Ported Code/DataAnalysis/RaoQYearVariability.R to project conventions, validated on synthetic data
 
 User supplied an existing script (year-to-year variability in Rao's Q across
