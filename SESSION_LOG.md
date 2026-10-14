@@ -4,6 +4,104 @@ Committed, dated record of work performed in this repository. Reverse
 chronological order, newest entry at the top. See CLAUDE.md for the
 convention this file follows.
 
+## 2026-10-14 20:05 UTC — Fixed DiversityVsFunctionStability.R: status filter was gating NEE/RECO/GPP/ET on fPAR availability, dropped LUE entirely
+
+User reported the previous version of `Code/DataAnalysis/DiversityVsFunctionStability.R`
+plotted n ~ 8 towers in every panel on real data, expected ~45. Not
+committed, left in the working tree per instruction.
+
+**Root cause (confirmed by re-reading `ComputeAnnualLUE.R`, not by running
+against real data -- this sandbox still has no `Data/` directory):** the
+previous version filtered the entire `lue_by_tower_year.csv` to `status ==
+"ok"` before splitting into the 5 per-function stability calculations.
+`status` in that file (`ComputeAnnualLUE.R` ~line 362) reflects ONLY whether
+LUE itself could be computed -- it requires both a flux match AND a
+QC-passed MODIS fPAR composite. A tower-year with complete, valid flux data
+but no usable MODIS fPAR composite got `status == "missing fpar data"` and
+was dropped entirely, which is correct for LUE but wrong for NEE/RECO/GPP/ET,
+none of which depend on fPAR/MODIS.
+
+Checked whether `nee_annual`/`reco_annual`/`gpp_annual`/`et_annual`
+themselves are ever blanked for fPAR-missing tower-years: they are not.
+`ComputeAnnualLUE.R` builds `combined <- full_join(fpar_annual_tbl,
+flux_annual_tbl, by = c("tower_id", "year"))` (~line 353) -- a full_join, so
+every tower-year in `flux_annual_tbl` (from `load_annual_flux_data()`,
+reading the real annual AmeriFlux files directly, independent of MODIS) is
+kept with its flux columns carried through unchanged regardless of a MODIS
+match. Only `status` and `lue_annual` are affected by fPAR availability.
+Conclusion: `lue_by_tower_year.csv` IS a correct source for the four flux
+variables, as long as nothing filters on `status` before using them -- this
+is a code-reading conclusion, not yet confirmed against the real file.
+
+**Changes:**
+- Removed the `status == "ok"` filter entirely from the flux load. Each of
+  NEE/RECO/GPP/ET is now filtered only on its own column being non-NA, so
+  each function gets its own tower set (n can and does differ per panel,
+  though in the synthetic reproduction below all four landed at the same n
+  by construction).
+- Removed LUE entirely per follow-up instruction: no LUE CV, no
+  implausibility check, no fPAR/PAR dependence, no fifth plot column. The
+  figure is now 2 rows (Rao's Q NIRv, Rao's Q all-bands) x 4 columns
+  (NEE, RECO, GPP, ET) = 8 panels, 8 tests (caption updated accordingly).
+  `lue_csv`'s required columns are now just `tower_id, year, nee_annual,
+  reco_annual, gpp_annual, et_annual` -- `status` is read and reported if
+  present (for diagnostics) but no longer required or filtered on.
+- Added `CV_MIN_YEARS <- 3` as a named constant at the top (previously a
+  hardcoded `3` in the stability `filter(n() >= 3)` call).
+- Added an attrition table (printed and written to
+  `Data/diversity_stability_attrition.csv`): towers in the spectral file
+  (status-filtered, `raoq_nirv` non-NA), towers in the flux file (any
+  status), towers in both, and towers with `>= CV_MIN_YEARS` non-NA years
+  per function -- each a separate row with an explicit description.
+- Added an ID-mismatch detector: lists tower IDs present in only one file,
+  then checks each against the other file's exclusive list after
+  normalizing case/whitespace/a leading `"US-"` prefix, flagging likely
+  spelling-variant matches rather than genuinely different towers.
+
+**Validation (synthetic data only, no real `Data/` access in this
+sandbox):** built a synthetic fixture specifically reproducing the bug
+scenario -- 46 flux towers with >= 3 valid flux years each, but only 8 of
+them carrying `status == "ok"` (the other 38 get `"missing fpar data"`
+despite complete flux data), plus one deliberately-planted ID-mismatch pair
+(`"US-x47"` in the spectral file vs `" us-X47 "` -- whitespace and case
+variant -- in the flux file). Ran end-to-end via `Rscript
+Code/DataAnalysis/DiversityVsFunctionStability.R` from the repo root:
+- Every one of the 8 panels showed n = 45 (up from the bug's n ~ 8),
+  confirming the fix.
+- The attrition table showed 46 spectral / 46 flux / 45 intersection
+  towers, and 46 towers meeting `>= 3` years for each of NEE/RECO/GPP/ET --
+  correctly flat across stages once `status` was removed from the flux
+  path.
+- The ID-mismatch detector correctly flagged `"US-x47"` / `" us-X47 "` as a
+  likely same-tower spelling variant and printed the pair.
+- Re-confirmed all four fail-loud paths still fire after the rewrite:
+  missing required flux column, missing flux file, duplicate tower_id x
+  year row (now checked against the full unfiltered flux file), and an
+  unmapped IGBP code -- all exit 1 with the real values printed.
+- Visually confirmed the rendered PNG: 8 panels (2x4), hollow points visible
+  on the 4 NEE-flagged towers, single consolidated legend, caption correctly
+  reads "8 tests", no clipping or overlap.
+- Deleted both synthetic input CSVs, all three generated output CSVs, and
+  the generated PNG afterward; restored the original
+  `NEONsites_Footprints.csv` from a backup; confirmed via `git status` and
+  `md5sum` that nothing synthetic persists and the real
+  `NEONsites_Footprints.csv` is byte-identical to before.
+
+**Unverified / remains to check against the real data:**
+- The actual real-data attrition table and per-panel n -- this entire fix
+  was validated by reproducing the bug mechanism in synthetic data and
+  confirming the fix resolves it, not by running against the real
+  `lue_by_tower_year.csv`. The user needs to run this on their server and
+  check the printed/saved attrition table.
+- Whether `lue_by_tower_year.csv`'s flux columns really are as complete as
+  the `full_join` code-reading predicts -- if the real attrition table still
+  shows unexpectedly few towers at the `flux` or `flux_years_*` stages, the
+  next step is reading `Data/NEON_Ameriflux/AnnualData/*.csv` directly
+  instead of going through `lue_by_tower_year.csv`, not implemented here
+  since the reasoning above suggested it shouldn't be necessary.
+- Whether any real ID-mismatch pairs exist (the synthetic test only
+  exercised the detector's logic on one planted case).
+
 ## 2026-10-14 19:10 UTC — New Code/DataAnalysis/DiversityVsFunctionStability.R: Rao's Q diversity vs. annual-function temporal stability, validated on synthetic data
 
 New script, one point per tower: x = per-tower mean Rao's Q (NIRv and all

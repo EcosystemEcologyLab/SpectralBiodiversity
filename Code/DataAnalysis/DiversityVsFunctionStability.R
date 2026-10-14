@@ -1,13 +1,59 @@
 #!/usr/bin/env Rscript
 # Spectral diversity (Rao's Q) vs. temporal stability of annual ecosystem
-# function (NEE, RECO, GPP, ET, LUE), one point per tower.
+# function (NEE, RECO, GPP, ET), one point per tower.
 # Usage: Rscript Code/DataAnalysis/DiversityVsFunctionStability.R [spectral_csv] [lue_csv] [data_dir] [fig_dir]
 #   spectral_csv default "./Data/spectral_diversity_by_year.csv"
-#   lue_csv      default "./Data/lue_by_tower_year.csv" (produced by ComputeAnnualLUE.R)
-#   data_dir     default "./Data"    (diversity_stability_by_tower.csv, diversity_stability_tests.csv)
+#   lue_csv      default "./Data/lue_by_tower_year.csv" (produced by ComputeAnnualLUE.R
+#                -- only its tower_id/year/nee_annual/reco_annual/gpp_annual/et_annual
+#                columns are used; see Section 2 for why this source is still correct
+#                even though the file name says "lue")
+#   data_dir     default "./Data"    (diversity_stability_by_tower.csv,
+#                                     diversity_stability_tests.csv,
+#                                     diversity_stability_attrition.csv)
 #   fig_dir      default "./Figures" (diversity_vs_function_stability.png)
 # Also runnable line-by-line in RStudio with the project root as the working
 # directory -- every default path below is relative to that root.
+#
+# ==============================================================================
+# LUE REMOVED (this revision) -- a prior version plotted n ~ 8 towers in every
+# panel (expected ~45). Root cause: that version filtered the ENTIRE
+# lue_by_tower_year.csv to `status == "ok"` before splitting into the 5
+# per-function stability calculations. But status in that file reflects
+# ONLY whether LUE itself could be computed (it requires BOTH a flux match
+# AND a QC-passed MODIS fPAR composite -- see
+# Code/DataAnalysis/ComputeAnnualLUE.R's `status <- case_when(is.na(fpar_annual)
+# ~ "missing fpar data", is.na(gpp_annual) | is.na(par_annual) ~ "missing flux
+# data", apar_annual == 0 ~ "divide by zero", TRUE ~ "ok")`, ~line 362). A
+# tower-year with complete, valid flux data but no usable MODIS fPAR composite
+# got status "missing fpar data" and was dropped entirely by that filter --
+# which makes sense for LUE (it genuinely needs fPAR) but is wrong for
+# NEE/RECO/GPP/ET, which don't depend on fPAR/MODIS at all.
+#
+# Investigated whether nee_annual/reco_annual/gpp_annual/et_annual themselves
+# are ever blanked or dropped for fPAR-missing tower-years: they are NOT.
+# ComputeAnnualLUE.R builds `combined <- full_join(fpar_annual_tbl,
+# flux_annual_tbl, by = c("tower_id", "year"))` (~line 353) -- a full_join, so
+# every tower-year present in flux_annual_tbl (which comes from
+# load_annual_flux_data(), reading the real annual AmeriFlux files directly --
+# entirely independent of MODIS) is kept, with its flux columns carried
+# through UNCHANGED regardless of whether a matching MODIS row exists. `status`
+# and `lue_annual` are the only columns affected by fPAR availability (~line
+# 359-369); gpp_annual/reco_annual/et_annual/nee_annual are never masked by it.
+# So lue_by_tower_year.csv IS a correct source for these four flux variables,
+# as long as nothing filters on `status` before using them -- confirmed by
+# reading the script, not run against real data (this sandbox still has no
+# Data/ directory; see SESSION_LOG.md). If the real file's flux columns turn
+# out to be sparser than this reasoning predicts, the attrition table below
+# (Section 2) will show it directly, and the fix at that point would be to
+# read the annual AmeriFlux files directly instead of trusting this file --
+# not implemented here since the join-level reasoning above indicates it
+# shouldn't be necessary.
+#
+# LUE, and the MODIS/fPAR/PAR dependence that came with it, is removed
+# entirely from this script: no lue_annual CV, no implausibility check, no
+# fifth plot column. The figure is now 2 rows (Rao's Q NIRv, Rao's Q
+# all-bands) x 4 columns (NEE, RECO, GPP, ET) = 8 panels, 8 tests.
+# ==============================================================================
 
 required_pkgs <- c("readr", "dplyr", "tidyr", "ggplot2", "patchwork", "stringr", "purrr")
 missing_pkgs <- required_pkgs[!required_pkgs %in% rownames(installed.packages())]
@@ -29,17 +75,23 @@ fig_dir      <- if (length(args) >= 4) args[4] else "./Figures"
 dir.create(data_dir, showWarnings = FALSE, recursive = TRUE)
 dir.create(fig_dir,  showWarnings = FALSE, recursive = TRUE)
 
-cv_mean_eps <- 1e-8  # |mean| below this is treated as "zero" for CV% (guards div-by-~0)
+cv_mean_eps  <- 1e-8  # |mean| below this is treated as "zero" for CV% (guards div-by-~0)
+CV_MIN_YEARS <- 3     # minimum non-NA flux years required to compute a tower's CV for a function
 
 diversity_map <- tibble::tibble(
   col   = c("raoq_nirv", "raoq_allbands"),
   label = c("Rao's Q (NIRv)", "Rao's Q (all bands)")
 )
 function_map <- tibble::tibble(
-  col     = c("nee", "reco", "gpp", "et", "lue"),
-  label   = c("NEE", "RECO", "GPP", "ET", "LUE"),
-  src_col = c("nee_annual", "reco_annual", "gpp_annual", "et_annual", "lue_annual")
+  col     = c("nee", "reco", "gpp", "et"),
+  label   = c("NEE", "RECO", "GPP", "ET"),
+  src_col = c("nee_annual", "reco_annual", "gpp_annual", "et_annual")
 )
+
+attrition <- tibble::tibble(stage = character(), description = character(), n_towers = integer())
+add_attrition <- function(stage, description, n_towers) {
+  attrition <<- bind_rows(attrition, tibble::tibble(stage = stage, description = description, n_towers = n_towers))
+}
 
 # ============================================================================
 # 1. Spectral diversity input -- columns confirmed against
@@ -75,56 +127,79 @@ if (nrow(dup_spec) > 0) {
        " (per-tower diversity mean assumes one value per tower-year). See offending rows above.")
 }
 
+spectral_valid <- spectral %>% filter(!is.na(raoq_nirv))
+n_spectral_towers <- n_distinct(spectral_valid$tower_id)
+add_attrition("spectral", "Towers in spectral_diversity_by_year.csv with status success/single-year AND raoq_nirv non-NA", n_spectral_towers)
+
 # ============================================================================
-# 2. LUE/flux input -- columns confirmed by reading
+# 2. Flux input -- columns confirmed by reading
 #    Code/DataAnalysis/ComputeAnnualLUE.R's own output `transmute()` call
 #    (~line 372): tower_id, year, fpar_annual, n_fpar_obs_used,
 #    n_fpar_obs_total, gpp_annual, reco_annual, et_annual, nee_annual,
-#    par_annual, lue_annual, status -- status in {"ok", "missing fpar data",
-#    "missing flux data", "divide by zero"} (same script, ~line 362-367).
-#    NEE_VUT_REF (AmeriFlux) is negative for net uptake -- that sign
-#    convention is NOT flipped anywhere in ComputeAnnualLUE.R or here.
+#    par_annual, lue_annual, status. Only tower_id/year/nee_annual/
+#    reco_annual/gpp_annual/et_annual are used below -- status is NOT
+#    filtered on (see the file header for why) and fpar/par/lue columns are
+#    not required. NEE_VUT_REF (AmeriFlux) is negative for net uptake -- that
+#    sign convention is NOT flipped anywhere in ComputeAnnualLUE.R or here.
 # ============================================================================
 if (!file.exists(lue_csv)) {
   stop(lue_csv, " not found. Run Code/DataAnalysis/ComputeAnnualLUE.R first to produce it.")
 }
 
-lue_required_cols <- c("tower_id", "year", "fpar_annual", "n_fpar_obs_used", "n_fpar_obs_total",
-                        "gpp_annual", "reco_annual", "et_annual", "nee_annual", "par_annual",
-                        "lue_annual", "status")
-lue_raw <- read_csv(lue_csv, show_col_types = FALSE)
-missing_cols <- setdiff(lue_required_cols, names(lue_raw))
+flux_required_cols <- c("tower_id", "year", "nee_annual", "reco_annual", "gpp_annual", "et_annual")
+flux_raw <- read_csv(lue_csv, show_col_types = FALSE)
+missing_cols <- setdiff(flux_required_cols, names(flux_raw))
 if (length(missing_cols) > 0) {
   stop("Missing required column(s) in ", lue_csv, ": ", paste(missing_cols, collapse = ", "),
-       "\nColumns present in file: ", paste(names(lue_raw), collapse = ", "))
+       "\nColumns present in file: ", paste(names(flux_raw), collapse = ", "))
 }
-lue_raw <- lue_raw %>% mutate(year = as.integer(year))
+flux_raw <- flux_raw %>% mutate(year = as.integer(year))
 
-cat("\n=== lue_by_tower_year.csv status values ===\n")
-print(table(lue_raw$status, useNA = "ifany"))
+if ("status" %in% names(flux_raw)) {
+  cat("\n=== lue_by_tower_year.csv status values (NOT used to filter nee/reco/gpp/et -- see file header) ===\n")
+  print(table(flux_raw$status, useNA = "ifany"))
+} else {
+  cat("\nNo status column in ", lue_csv, " -- not required, not used.\n", sep = "")
+}
+cat("NEE sign convention: negative = net uptake (AmeriFlux convention), not flipped.\n")
 
-lue <- lue_raw %>% filter(status == "ok")
-cat("Kept ", nrow(lue), " tower-year(s) with status == \"ok\" (NEE sign convention: negative = net ",
-    "uptake, AmeriFlux convention, not flipped).\n", sep = "")
-
-dup_lue <- lue %>% count(tower_id, year) %>% filter(n > 1)
-if (nrow(dup_lue) > 0) {
-  offending <- lue %>% semi_join(dup_lue, by = c("tower_id", "year")) %>% arrange(tower_id, year)
+dup_flux <- flux_raw %>% count(tower_id, year) %>% filter(n > 1)
+if (nrow(dup_flux) > 0) {
+  offending <- flux_raw %>% semi_join(dup_flux, by = c("tower_id", "year")) %>% arrange(tower_id, year)
   print(offending)
   stop("Duplicate tower_id x year rows found in ", lue_csv,
        " (per-tower stability CV assumes one value per tower-year). See offending rows above.")
 }
 
-lue_med <- median(lue$lue_annual, na.rm = TRUE)
-cat("\nlue_annual (status == \"ok\"): min = ", round(min(lue$lue_annual, na.rm = TRUE), 4),
-    ", median = ", round(lue_med, 4), ", max = ", round(max(lue$lue_annual, na.rm = TRUE), 4), "\n", sep = "")
-implausible_lue <- lue %>% filter(!is.na(lue_annual) & (lue_annual < 0 | lue_annual > 10 * lue_med))
-if (nrow(implausible_lue) > 0) {
-  cat("!! ", nrow(implausible_lue), " physically implausible lue_annual value(s) (negative or > 10x ",
-      "the median) -- kept in the analysis, not dropped:\n", sep = "")
-  print(as.data.frame(implausible_lue %>% select(tower_id, year, lue_annual)))
-} else {
-  cat("No implausible lue_annual values (negative or > 10x median) found.\n")
+n_flux_towers <- n_distinct(flux_raw$tower_id)
+add_attrition("flux", "Towers in lue_by_tower_year.csv (any status -- status not used to filter)", n_flux_towers)
+
+# ---- intersection + ID-mismatch check ----
+spectral_towers_set <- unique(spectral_valid$tower_id)
+flux_towers_set     <- unique(flux_raw$tower_id)
+n_intersection <- length(intersect(spectral_towers_set, flux_towers_set))
+add_attrition("intersection", "Towers present in both (exact tower_id match)", n_intersection)
+
+only_in_spectral <- setdiff(spectral_towers_set, flux_towers_set)
+only_in_flux     <- setdiff(flux_towers_set, spectral_towers_set)
+cat("\n=== Towers in only one file ===\n")
+cat("Only in spectral (", length(only_in_spectral), "): ", paste(sort(only_in_spectral), collapse = ", "), "\n", sep = "")
+cat("Only in flux (", length(only_in_flux), "): ", paste(sort(only_in_flux), collapse = ", "), "\n", sep = "")
+
+normalize_id <- function(x) sub("^US-", "", trimws(toupper(x)))
+mismatch_pairs <- tibble::tibble(spectral_id = character(), flux_id = character())
+for (a in only_in_spectral) {
+  hit <- only_in_flux[normalize_id(only_in_flux) == normalize_id(a)]
+  if (length(hit) > 0) {
+    mismatch_pairs <- bind_rows(mismatch_pairs, tibble::tibble(spectral_id = a, flux_id = hit))
+  }
+}
+if (nrow(mismatch_pairs) > 0) {
+  cat("\n!! Likely ID MISMATCHES (same tower, different case/whitespace/\"US-\" prefix spelling):\n")
+  print(as.data.frame(mismatch_pairs))
+} else if (length(only_in_spectral) > 0 || length(only_in_flux) > 0) {
+  cat("\nNo case/whitespace/\"US-\"-prefix mismatches detected among the IDs found in only one file ",
+      "(they appear to be genuinely different towers, not spelling variants).\n", sep = "")
 }
 
 # ============================================================================
@@ -184,12 +259,12 @@ sites_lookup <- sites_raw %>%
 
 # ============================================================================
 # 4. Per-tower diversity (mean across all available spectral years) and
-#    per-tower stability (temporal CV% across all available flux years).
-#    These two periods are NOT aligned -- a tower's diversity mean can come
-#    from entirely different years than its stability CV; see the figure
-#    caption and the console summary below.
+#    per-tower stability (temporal CV% across all available flux years, no
+#    status filter -- just per-function non-NA). These two periods are NOT
+#    aligned -- a tower's diversity mean can come from entirely different
+#    years than its stability CV; see the figure caption and console below.
 # ============================================================================
-diversity_tbl <- spectral %>%
+diversity_tbl <- spectral_valid %>%
   group_by(tower_id) %>%
   summarise(n_spectral_years = n(),
             neon_site = dplyr::first(neon_site),
@@ -198,23 +273,14 @@ diversity_tbl <- spectral %>%
             .groups = "drop") %>%
   mutate(across(c(mean_raoq_nirv, mean_raoq_allbands), ~ ifelse(is.nan(.x), NA_real_, .x)))
 
-n_spectral_towers <- n_distinct(spectral$tower_id)
-n_flux_towers     <- n_distinct(lue$tower_id)
-n_intersection    <- length(intersect(spectral$tower_id, lue$tower_id))
-cat("\n=== Tower counts ===\n")
-cat("n spectral towers:", n_spectral_towers, "\n")
-cat("n flux (LUE, status == \"ok\") towers:", n_flux_towers, "\n")
-cat("n intersection (both diversity and flux data available):", n_intersection, "\n")
-
-stability_long <- lue %>%
-  select(tower_id, year, nee = nee_annual, reco = reco_annual, gpp = gpp_annual,
-         et = et_annual, lue = lue_annual) %>%
-  pivot_longer(cols = c(nee, reco, gpp, et, lue), names_to = "function_name", values_to = "value")
+stability_long <- flux_raw %>%
+  select(tower_id, year, nee = nee_annual, reco = reco_annual, gpp = gpp_annual, et = et_annual) %>%
+  pivot_longer(cols = c(nee, reco, gpp, et), names_to = "function_name", values_to = "value")
 
 stability_tbl <- stability_long %>%
   filter(!is.na(value)) %>%
   group_by(tower_id, function_name) %>%
-  filter(n() >= 3) %>%
+  filter(n() >= CV_MIN_YEARS) %>%
   summarise(n_years_used = n(), mean = mean(value), sd = sd(value),
             any_pos = any(value > 0), any_neg = any(value < 0), .groups = "drop") %>%
   mutate(
@@ -225,18 +291,25 @@ stability_tbl <- stability_long %>%
     cv_pct = ifelse(cv_guarded_zero, NA_real_, cv_raw)
   )
 
-cat("\n=== Per-function stability summary ===\n")
+cat("\n=== Per-function stability summary (>= ", CV_MIN_YEARS, " non-NA years, no status filter) ===\n", sep = "")
 for (fn in function_map$col) {
   sub <- stability_tbl %>% filter(function_name == fn)
   n_guarded <- sum(sub$cv_guarded_zero & !sub$sign_change)
   flagged <- sub %>% filter(cv_flagged)
-  cat(sprintf("%s: %d tower(s) with >= 3 years; %d mean~0-guarded; %d flagged unstable",
-              toupper(fn), nrow(sub), n_guarded, nrow(flagged)))
+  cat(sprintf("%s: %d tower(s) with >= %d years; %d mean~0-guarded; %d flagged unstable",
+              toupper(fn), nrow(sub), CV_MIN_YEARS, n_guarded, nrow(flagged)))
   if (nrow(flagged) > 0) {
     cat(" (", paste(flagged$tower_id, collapse = ", "), ")", sep = "")
   }
   cat("\n")
+  add_attrition(paste0("flux_years_", fn),
+                paste0(toupper(fn), ": towers with >= ", CV_MIN_YEARS, " non-NA years (no status filter)"),
+                nrow(sub))
 }
+
+cat("\n=== Attrition table ===\n")
+print(attrition)
+write_csv(attrition, file.path(data_dir, "diversity_stability_attrition.csv"))
 
 stability_wide <- stability_tbl %>%
   select(tower_id, function_name, n_years_used, mean, sd, cv_pct, cv_flagged) %>%
@@ -244,7 +317,7 @@ stability_wide <- stability_tbl %>%
               values_from = c(n_years_used, mean, sd, cv_pct, cv_flagged),
               names_glue = "{function_name}_{.value}")
 
-all_towers <- union(diversity_tbl$tower_id, unique(lue$tower_id))
+all_towers <- union(diversity_tbl$tower_id, flux_towers_set)
 master <- tibble(tower_id = all_towers) %>%
   left_join(diversity_tbl, by = "tower_id") %>%
   left_join(stability_wide, by = "tower_id") %>%
@@ -267,9 +340,9 @@ for (fn in function_map$col) {
 write_csv(master %>% select(all_of(out_cols)), file.path(data_dir, "diversity_stability_by_tower.csv"))
 
 # ============================================================================
-# 5. Rank-order tests (Spearman rho, Kendall tau) for each of the 10
+# 5. Rank-order tests (Spearman rho, Kendall tau) for each of the 8
 #    diversity-metric x function panels, BH FDR within each diversity metric
-#    across its 5 functions (figure shows raw rho/p only -- FDR columns are
+#    across its 4 functions (figure shows raw rho/p only -- FDR columns are
 #    CSV-only, per instruction).
 # ============================================================================
 compute_rank_tests <- function(x, y) {
@@ -297,7 +370,7 @@ test_results <- panel_grid %>%
   mutate(rho_p_fdr = p.adjust(rho_p, method = "BH"), tau_p_fdr = p.adjust(tau_p, method = "BH")) %>%
   ungroup()
 
-cat("\n=== Rank-order tests (raw p; BH FDR within each diversity metric) ===\n")
+cat("\n=== Rank-order tests (raw p; BH FDR within each diversity metric; 8 tests total) ===\n")
 print(test_results)
 
 write_csv(
@@ -306,7 +379,7 @@ write_csv(
 )
 
 # ============================================================================
-# 6. Figure -- 2 (diversity metrics) x 5 (functions) = 10 panels, built as
+# 6. Figure -- 2 (diversity metrics) x 4 (functions) = 8 panels, built as
 #    individual ggplot objects and assembled with patchwork (not
 #    facet_grid/facet_wrap): each panel needs its own log10-vs-linear y-axis
 #    decision (a per-function property shared down both rows of that
@@ -337,7 +410,7 @@ for (i in seq_len(nrow(function_y_info))) {
 }
 
 # x range is a per-DIVERSITY-METRIC (row) property, shared across that row's
-# 5 panels regardless of each panel's own NA pattern.
+# 4 panels regardless of each panel's own NA pattern.
 diversity_x_range <- diversity_map %>%
   rowwise() %>%
   mutate({
@@ -396,10 +469,10 @@ for (dm in diversity_map$col) for (fn in function_map$col) {
            shape = guide_legend(title = "Flagged\nunstable CV", override.aes = list(size = 3)))
 }
 
-# plot_layout(guides = "collect") merges the 10 panels' identical
+# plot_layout(guides = "collect") merges the 8 panels' identical
 # colour/shape scales into one shared legend (patchwork's standard
 # de-duplication) instead of rendering a legend inside every panel.
-fig <- wrap_plots(panels, nrow = 2, ncol = 5) +
+fig <- wrap_plots(panels, nrow = 2, ncol = 4) +
   plot_layout(guides = "collect") +
   plot_annotation(
     title = "Spectral diversity vs. temporal stability of annual ecosystem function",
@@ -409,14 +482,14 @@ fig <- wrap_plots(panels, nrow = 2, ncol = 5) +
       "diversity and stability can reflect different year ranges for the same tower. Hollow points =",
       "CV unreliable (|mean| < sd, i.e. CV > 100%, or the annual values changed sign across years).",
       "NEE is negative for net uptake (AmeriFlux sign convention), not flipped. Raw p-values shown;",
-      "10 tests, no multiplicity correction in this figure (see diversity_stability_tests.csv for BH FDR)."
-    ), width = 160),
+      "8 tests, no multiplicity correction in this figure (see diversity_stability_tests.csv for BH FDR)."
+    ), width = 150),
     theme = theme(plot.title = element_text(face = "bold", size = 13),
                   plot.caption = element_text(size = 7.5, colour = "grey30", hjust = 0))
   ) &
   theme(legend.position = "right")
 
 ggsave(file.path(fig_dir, "diversity_vs_function_stability.png"), fig,
-       width = 19, height = 6.5, dpi = 200, bg = "white", limitsize = FALSE)
+       width = 15.5, height = 6.5, dpi = 200, bg = "white", limitsize = FALSE)
 
 cat("\nSaved CSVs to", data_dir, "and figure to", fig_dir, "\n")
