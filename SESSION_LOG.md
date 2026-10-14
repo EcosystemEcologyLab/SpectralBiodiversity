@@ -4,6 +4,135 @@ Committed, dated record of work performed in this repository. Reverse
 chronological order, newest entry at the top. See CLAUDE.md for the
 convention this file follows.
 
+## 2026-10-14 19:10 UTC — New Code/DataAnalysis/DiversityVsFunctionStability.R: Rao's Q diversity vs. annual-function temporal stability, validated on synthetic data
+
+New script, one point per tower: x = per-tower mean Rao's Q (NIRv and all
+bands, two predictors) over its available spectral years; y = per-tower
+temporal CV% (across years) of annual NEE/RECO/GPP/ET/LUE. Not committed,
+left in the working tree per instruction.
+
+**Column evidence:**
+- `spectral_diversity_by_year.csv`: columns and the two valid success
+  statuses confirmed by reading `Code/AnnualSpectralDiversity.R`'s `results`
+  tibble (~line 966) and its status assignment (~line 1038:
+  `status <- if (tower_id %in% single_year_tower_ids) "success (single-year
+  site)" else "success"`) -- both values are treated as successful here, not
+  just `"success"`, since a single-year site is still a valid (if
+  less-informative) diversity mean.
+- `lue_by_tower_year.csv`: columns and status values confirmed by reading
+  `Code/DataAnalysis/ComputeAnnualLUE.R`'s own output `transmute()` call
+  (~line 372) and its `status` logic (~line 362-367): `tower_id, year,
+  fpar_annual, n_fpar_obs_used, n_fpar_obs_total, gpp_annual, reco_annual,
+  et_annual, nee_annual, par_annual, lue_annual, status`, status in
+  `{"ok","missing fpar data","missing flux data","divide by zero"}`. Only
+  `"ok"` rows are kept, per instruction. NEE sign convention (negative =
+  net uptake, AmeriFlux `NEE_VUT_REF`) is stated in the console output and
+  figure caption, never flipped.
+- Ecosystem bins: the bin map, bin order, colour palette, candidate-file
+  fallback (`./Data/NEONsites.csv` then `./NEONsites_Footprints.csv`),
+  `tower_id = Site.ID` join key, and unmapped-code `stop()` were copied
+  verbatim from `Code/DataAnalysis/RaoQYearVariability.R` Section 2 (current
+  committed version, not re-derived) -- that script stayed unchanged and
+  remains the source of truth if the two ever diverge.
+
+**Stability calculation:** CV% = 100 * sd / |mean| per tower per function,
+requiring >= 3 non-NA years (mean == 0 or non-finite CV -> `cv_pct = NA`,
+counted). A tower is flagged `cv_flagged = TRUE` when `|mean| < sd` (CV >
+100%) OR the annual values change sign across years -- applied identically
+to all 5 functions, not just NEE (confirmed via synthetic data: NEE flagged
+4/30 towers including both deliberately-constructed cases below; the other
+four functions flagged 0-1). Flagged towers are kept in both the plot
+(hollow point) and the rank-order tests, never dropped.
+
+**Figure:** 10 panels (2 diversity metrics x 5 functions), built as
+individual ggplot objects combined with `patchwork::wrap_plots()` rather
+than `facet_grid`/`facet_wrap` -- the desired scale behavior (y free per
+function/column, x shared per diversity-metric/row) is the opposite of
+`facet_grid`'s native free_x-per-column/free_y-per-row semantics, so each
+panel is built separately with its own log10-vs-linear decision (computed
+from that function's full CV distribution, not just the paired subset) and
+a shared x range (computed from that diversity metric's full distribution).
+Per-panel subtitle (`"Spearman rho = x.xx (p = x.xxx, n = NN)"`, or
+`"insufficient data"` for n < 5) uses raw p only; `plot_layout(guides =
+"collect")` merges the 10 panels' legends into one -- this required forcing
+`flagged` to a 2-level factor with `drop = FALSE` in every panel (an early
+version produced two separate/inconsistent legends because most panels had
+no flagged==TRUE points, so their shape scale only had one observed level
+and patchwork couldn't merge it with panels that had both levels).
+
+**Validation (synthetic data only -- no access to the real CSVs or the real
+ecosystem file):**
+- Built synthetic `spectral_diversity_by_year.csv` (40 towers, 1-9 years
+  each, 3 injected NAs, 4 failed-status rows, one single-year-site status
+  row) and `lue_by_tower_year.csv` (38 towers, overlapping but not
+  identical to the spectral towers -- 5 spectral-only, 3 flux-only -- plus
+  one tower with NEE alternating sign across 4 years, one with NEE values
+  averaging to exactly 0, one with only 2 flux years (below the >=3
+  threshold), one with a deliberately implausible negative `lue_annual`,
+  and 3 failed-status rows) and a matching synthetic
+  `NEONsites_Footprints.csv`.
+- Ran end-to-end via `Rscript Code/DataAnalysis/DiversityVsFunctionStability.R`
+  from the repo root: both CSVs landed in `Data/`, the PNG in `Figures/`,
+  zero warnings; console reported 40 spectral / 38 flux / 35 intersection
+  towers, the implausible LUE value printed without being dropped, and the
+  3 flux-only towers correctly reported as having no ecosystem match.
+- Hand-checked the two deliberately-constructed towers in the output CSV:
+  the sign-change tower (`nee_annual = c(-200,50,-150,50)`) got
+  `nee_mean = -62.5` (matches `(-200+50-150+50)/4` by hand), `nee_cv_pct =
+  210.4`, `nee_cv_flagged = TRUE`; the zero-mean tower got `nee_mean = 0`,
+  `nee_cv_pct = NA` (guarded), but `nee_cv_flagged` still `TRUE` (the flag
+  is independent of the CV-NA guard, as specified); the 2-year tower was
+  correctly excluded entirely (`NA` across all `nee_*` columns, never
+  reaching the >=3-year threshold).
+- Confirmed all four fail-loud paths: a spectral copy missing
+  `raoq_allbands` stopped with the real column list (exit 1); a missing
+  `lue_by_tower_year.csv` path stopped telling the user to run
+  `ComputeAnnualLUE.R` first (exit 1); a copy of the LUE csv with one
+  duplicated `tower_id`/`year` row stopped with the offending rows printed
+  (exit 1); a sites file with an unmapped IGBP code (`WSA`) stopped listing
+  the code (exit 1).
+- Cross-checked the script's `raoq_nirv` x `nee` panel (rho = 0.172961,
+  p = 0.378774, n = 28) against a standalone
+  `cor.test(method = "spearman", exact = FALSE)` call on the same paired
+  data -- identical to all printed digits.
+- Visually inspected the rendered PNG at each fix: caught and fixed a
+  layout bug where the intended "legend row" was rendering a full duplicate
+  NEE panel instead of just a legend (replaced with `plot_layout(guides =
+  "collect")`), and a bug where the collected legend split into two
+  inconsistent blocks (fixed via the 2-level factor + `drop = FALSE` above).
+  Final render: all 10 panels legible, hollow points visible on the NEE and
+  LUE panels where expected, caption wrapped without clipping, single
+  consolidated legend.
+- Deleted both synthetic input CSVs, both generated output CSVs, and the
+  generated PNG afterward; restored the original `NEONsites_Footprints.csv`
+  from a backup; confirmed via `git status` and `md5sum` that nothing
+  synthetic persists and the repo's real `NEONsites_Footprints.csv` is
+  byte-identical to before.
+
+**Unverified / remains to check against the real data:**
+- The real column names in both input files -- in particular whether
+  `tower_id` appears in `spectral_diversity_by_year.csv` at all (same open
+  question as the `RaoQYearVariability.R` rewrite) and whether
+  `lue_by_tower_year.csv` actually exists yet (this sandbox has never had
+  `Data/`, so `ComputeAnnualLUE.R` has never been run against real data
+  either -- see its own SESSION_LOG entry).
+- Real tower counts at each stage (spectral/flux/intersection) and per
+  panel -- the synthetic run's 28-29 n per panel is a synthetic-data
+  artifact, not a prediction for the real network.
+- Whether any real function's CV distribution actually spans > 50x
+  (triggering the log10 axis) or any real tower is flagged unstable --
+  both branches were only exercised by deliberately constructed synthetic
+  cases here.
+- All real numeric results (rho/p per panel, which pairs are FDR-significant
+  within each diversity metric) -- only the refactor's mechanics and
+  validation scaffolding were checked, not scientific conclusions.
+- Real `lue_annual`/`nee_annual`/etc. magnitudes and units -- this script's
+  statistics (CV%, Spearman rho) are scale-invariant, so unit correctness
+  doesn't affect the math, but the implausible-value console check (> 10x
+  median) assumes the real median is a reasonable implausibility anchor,
+  which was only validated against one deliberately injected synthetic
+  outlier.
+
 ## 2026-10-14 18:20 UTC — Rewrote Code/DataAnalysis/RaoQYearVariability.R: 7-metric ecosystem CV analysis, validated on synthetic data
 
 User asked for a full rewrite (not just a port) of
